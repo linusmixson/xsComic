@@ -2,18 +2,18 @@
 FROM debian:13
 
 ARG TARGETARCH
-ARG OBJC3_SDK_VERSION=v0.1.0-preview.1
+ARG OBJC3_SDK_VERSION=v0.1.0-preview.2
 ARG OBJC3_SDK_ROOT_BASE=/opt/objc3c
 
-# Pinned SHA-256 digests from doublemover/Slopjective-C v0.1.0-preview.1 SHA256SUMS
-ARG INSTALL_LINUX_SH_SHA256=872e127695ee6ce91801faba0e17a343860bf2751bee2bd49d98b1e8ec3cc4ba
-ARG INSTALL_SDK_PY_SHA256=5ca49105c707cc6be5dd6b1269dda836dc9f1f2067eb44d4924a4a7c1cab962e
-ARG SDK_AARCH64_SHA256=390a78c403cf9e391a973abd91bbf296e0242136a43ec87eab48d017574e5ee9
-ARG SDK_X86_64_SHA256=279269c7e87b56289e11e800097f2490dd18d2124fc456306665471fab207222
+# Pinned SHA-256 digests from doublemover/Slopjective-C v0.1.0-preview.2 SHA256SUMS
+ARG INSTALL_LINUX_SH_SHA256=876d11ed6317b3566153c839f411fc089e7bb9afb239cd208b1050fd5d2c48e8
+ARG INSTALL_SDK_PY_SHA256=bd004954812c41d0b663181a249f0808c205351a9716259c0c36765f94fb4745
+ARG SDK_AARCH64_SHA256=19e25bdabb579823fcbe3ecf8817b553c10fa3e229049525917b230584cccf86
+ARG SDK_X86_64_SHA256=fe486ec93c669d45a75a1c75fba91e36a31adb433b8971bfaff76e08f4ebd51b
 
 # Layer 1: Download, verify, and install the official Slopjective-C Linux SDK.
 # Kept separate and before the xsComic dev-library layer so Docker caches the
-# ~494 MB SDK archive download and extraction across library tweaks.
+# approximately 500 MB SDK archive download and extraction across library tweaks.
 RUN set -eu; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "$arch" in \
@@ -83,7 +83,8 @@ RUN set -eu; \
         xdotool \
         fonts-dejavu-core \
         python3 \
-        python3-pil; \
+        python3-pil \
+        zenity; \
     install -d -m 1777 /tmp/.X11-unix; \
     rm -rf /var/lib/apt/lists/*
 

@@ -2,9 +2,9 @@ name: Linux
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, port_slopjective_c]
   push:
-    branches: [master]
+    branches: [master, port_slopjective_c]
   workflow_dispatch:
 
 permissions:

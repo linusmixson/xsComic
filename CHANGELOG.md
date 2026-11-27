@@ -10,7 +10,7 @@ macOS Objective-C / AppKit / Metal application (`Sources/xsComic/`,
 
 - added `Sources/xsComicLinux/XSCBase.{h,objc3}`: minimal
   `__attribute__((objc_root_class))` ARC root class (`XSCObject`) targeting the
-  Slopjective-C `objc3c` (`v0.1.0-preview.1`, patched Clang 23.1.5, GNUstep 2.2
+  Slopjective-C `objc3c` (`v0.1.0-preview.2`, patched Clang 23.1.5, GNUstep 2.2
   ABI + `libobjc2`, zero GNUstep-Base) runtime, with `XSCString`, `XSCData`,
   `XSCError <Error>`, `XSCIndexList`, main-thread queue/timer dispatcher with
   event-loop wakeup hook, and background pthread pool; uses Objective-C 3.0
@@ -41,7 +41,8 @@ macOS Objective-C / AppKit / Metal application (`Sources/xsComic/`,
   toolbar, collapsible page sidebar, empty CTA, direct Jump-to-Page modal
   (`Ctrl+Shift+G` / `G`), XDG-persisted settings popover (`prefs.ini`),
   drag-and-drop, a cancellable file picker, and deterministic `--screenshot`
-  capture with distinct usage and rendering failure statuses;
+  capture with atomic publication, caller-selected permissions, and distinct
+  usage and rendering failure statuses;
 - added Debian 13 + pinned Slopjective-C SDK Docker toolchain
   (`docker/Dockerfile`, `scripts/docker-env.sh`), disjoint native-or-Docker
   Linux scripts (`scripts/build-linux.sh`, `scripts/run-linux-tests.sh`,
@@ -52,7 +53,7 @@ macOS Objective-C / AppKit / Metal application (`Sources/xsComic/`,
   an E2E rendered-pixel and X11 interaction smoke suite
   (`Tests/xsComicLinuxTests/smoke.py`), Linux architecture documentation
   (`docs/linux.md`), and a reproducible audit record (`Metrics/linux-objc3.json`);
-- verified Debian 13 `aarch64` release (`-Oz -flto=thin -Wl,--gc-sections
+- recorded a Preview 1 Debian 13 `aarch64` release (`-Oz -flto=thin -Wl,--gc-sections
   -Wl,--as-needed` + `strip`) footprint, sanitizers, E2E smoke checks, and
   benchmarks: **289.3 KiB (296,272 bytes)** stripped `build/linux/xscomic` (16
   direct shared libraries, 0 unused), `191 passed, 0 failed` (ASan + UBSan +

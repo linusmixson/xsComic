@@ -20,7 +20,7 @@ Raw JSON measurements live in [`../Metrics/`](../Metrics/), including the Linux 
 │   └── xsComicLinuxTests/    Linux core test/benchmark suite (main.objc3, 191 assertions) & E2E smoke (smoke.py)
 ├── .github/workflows/        Linux (x86-64/AArch64) and macOS (arm64) CI workflows
 ├── docker/
-│   └── Dockerfile            Debian 13 + pinned Slopjective-C SDK (v0.1.0-preview.1) toolchain image
+│   └── Dockerfile            Debian 13 + pinned Slopjective-C SDK (v0.1.0-preview.2) toolchain image
 ├── Assets/                   compiled Assets.car, alternate SVG, and brand masters
 ├── Metrics/                  raw JSON measurement records (macOS + linux-objc3.json)
 ├── docs/

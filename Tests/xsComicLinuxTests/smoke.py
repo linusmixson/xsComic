@@ -1,11 +1,13 @@
-"""Verify the Linux CLI and actual OpenGL output with ordinary comic pages."""
+"""Verify the Objective-C 3 reader's CLI and OpenGL output with ordinary comic pages."""
 
 import argparse
 import io
 import os
 from pathlib import Path
 import signal
+from stat import S_IMODE
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import time
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -30,7 +32,7 @@ def test_rendering(app, directory, env):
     settings = ("--single", "--size=800x600")
 
     def run(*arguments):
-        return subprocess.run([app, *arguments], env=env, capture_output=True, text=True, timeout=30)
+        return subprocess.run([app, *arguments], env=env, capture_output=True, text=True, timeout=30, umask=0o027)
 
     def capture(name, book=None, *options):
         output = directory / f"{name}.png"
@@ -39,6 +41,7 @@ def test_rendering(app, directory, env):
             args.append(book)
         result = run(*args)
         assert result.returncode == 0, result.stderr
+        assert S_IMODE(output.stat().st_mode) == 0o640
         with Image.open(output) as screenshot:
             assert screenshot.size == (800, 600), screenshot.size
             return screenshot.convert("RGB")
@@ -162,7 +165,7 @@ def test_rendering(app, directory, env):
     ]:
         assert run(*arguments).returncode == 2, arguments
     assert run("--help").returncode == 0
-    print("Linux CLI and pixel checks passed", flush=True)
+    print("Objective-C 3 CLI and pixel checks passed", flush=True)
     return book
 
 
@@ -288,9 +291,13 @@ def main():
     parser.add_argument("app", type=lambda value: Path(value).resolve())
     parser.add_argument("--x11", action="store_true", help="exercise X11 input, animation, and the file picker")
     args = parser.parse_args()
+    if args.x11 and sys.platform != "linux":
+        parser.error("--x11 requires Linux")
     with TemporaryDirectory(prefix="xscomic-smoke-") as temporary:
         directory = Path(temporary)
-        env = {**os.environ, "XDG_CONFIG_HOME": str(directory / "config"), "LIBGL_ALWAYS_SOFTWARE": "1"}
+        env = {**os.environ, "XDG_CONFIG_HOME": str(directory / "config")}
+        if sys.platform == "linux":
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         book = test_rendering(args.app, directory, env)
         if args.x11:
             test_picker(args.app, directory, env, book)

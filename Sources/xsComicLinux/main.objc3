@@ -1,8 +1,8 @@
 /*
- main.objc3 — Native Linux SDL2 + OpenGL 3.3 Core desktop shell for xsComic.
+ main.objc3 — SDL2 and OpenGL desktop shell for xsComic.
 
  Architecture:
-   - Single-process, minimal-dependency Linux desktop UI built on SDL2,
+   - Desktop UI built on SDL2,
      OpenGL 3.3 Core, SDL2_ttf (DejaVu Sans), and libpng.
    - Reactive zero-busy-wait event loop: background archive open / image decode
      completions push a registered SDL user event via xsc_set_main_wakeup() so
@@ -19,6 +19,7 @@
 #include "XSCImageStore.h"
 #include "XSCReaderModel.h"
 
+#define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_opengl.h>
 #include <SDL2/SDL_ttf.h>
@@ -38,6 +39,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #pragma mark - Constants & Theme Palette
 
@@ -133,7 +137,11 @@ static bool xsc_prefs_path(char *outBuf, size_t outCap) {
     if (home && home[0] != '\0') {
         size_t len = strlen(home);
         while (len > 1u && home[len - 1u] == '/') len--;
+#ifdef __APPLE__
+        int n = snprintf(outBuf, outCap, "%.*s/Library/Application Support/xsComic ObjC3/prefs.ini", (int)len, home);
+#else
         int n = snprintf(outBuf, outCap, "%.*s/.config/xscomic/prefs.ini", (int)len, home);
+#endif
         return n > 0 && (size_t)n < outCap;
     }
     return false;
@@ -241,7 +249,7 @@ static bool xsc_png_write_rows(png_structp png,
     return true;
 }
 
-static bool xsc_write_rgba_png(const char *path, int width, int height, const uint8_t *rgbaBottomUp) {
+static bool xsc_write_rgba_png(const char *path, mode_t mode, int width, int height, const uint8_t *rgbaBottomUp) {
     if (!path || width <= 0 || height <= 0 || !rgbaBottomUp) return false;
     const char *slash = strrchr(path, '/');
     size_t directoryLength = slash ? (size_t)(slash - path) + 1u : 0u;
@@ -254,10 +262,6 @@ static bool xsc_write_rgba_png(const char *path, int width, int height, const ui
     int fd = mkostemp(tempPath, O_CLOEXEC);
     if (fd < 0) return false;
     defer { if (tempPath[0] != '\0') unlink(tempPath); }
-
-    mode_t mask = umask(0);
-    umask(mask);
-    (void)fchmod(fd, (mode_t)(0666 & ~mask));
 
     FILE *fp = fdopen(fd, "wb");
     if (!fp) {
@@ -273,6 +277,7 @@ static bool xsc_write_rgba_png(const char *path, int width, int height, const ui
     if (!info) return false;
 
     bool ok = xsc_png_write_rows(png, info, fp, width, height, rgbaBottomUp);
+    if (ok && (fflush(fp) != 0 || fchmod(fd, mode) != 0)) ok = false;
     if (fclose(fp) != 0) ok = false;
     fp = NULL;
     if (!ok || rename(tempPath, path) != 0) return false;
@@ -371,6 +376,9 @@ typedef struct XSCTextCacheEntry {
 static const char *xsc_find_font_path(int style) {
     // style: 0 = regular, 1 = bold, 2 = mono
     static const char * const kRegularPaths[] = {
+#ifdef __APPLE__
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+#endif
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
@@ -378,6 +386,9 @@ static const char *xsc_find_font_path(int style) {
         NULL
     };
     static const char * const kBoldPaths[] = {
+#ifdef __APPLE__
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+#endif
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
@@ -386,6 +397,9 @@ static const char *xsc_find_font_path(int style) {
         NULL
     };
     static const char * const kMonoPaths[] = {
+#ifdef __APPLE__
+        "/System/Library/Fonts/Menlo.ttc",
+#endif
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
         "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
@@ -1155,12 +1169,30 @@ static void xsc_compute_layout(XSCLayout *L, float winW, float winH, bool showSi
 extern char **environ;
 
 static int xsc_spawn_file_picker(pid_t *pid, int *readFd) {
+#ifdef __APPLE__
+    char helper[PATH_MAX];
+    uint32_t length = sizeof(helper);
+    if (_NSGetExecutablePath(helper, &length) != 0) return ENAMETOOLONG;
+    char *basename = strrchr(helper, '/');
+    if (!basename) return ENOENT;
+    static const char name[] = "xscomic-open";
+    if ((size_t)(basename + 1 - helper) + sizeof(name) > sizeof(helper)) return ENAMETOOLONG;
+    memcpy(basename + 1, name, sizeof(name));
+#endif
     int fds[2];
+#ifdef __APPLE__
+    if (pipe(fds) != 0) return errno;
+#else
     if (pipe2(fds, O_CLOEXEC) != 0) return errno;
+#endif
     defer {
         if (fds[0] >= 0) close(fds[0]);
         close(fds[1]);
     }
+#ifdef __APPLE__
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0) return errno;
+#endif
     if (fcntl(fds[0], F_SETFL, O_NONBLOCK) != 0) return errno;
 
     posix_spawn_file_actions_t actions;
@@ -1173,6 +1205,10 @@ static int xsc_spawn_file_picker(pid_t *pid, int *readFd) {
     rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     if (rc != 0) return rc;
 
+#ifdef __APPLE__
+    char *arguments[] = { helper, NULL };
+    rc = posix_spawn(pid, helper, &actions, NULL, arguments, environ);
+#else
     const char *hostLibrary = getenv("XSCOMIC_HOST_LIBRARY_DIR");
     const char *directory = (hostLibrary && hostLibrary[0] != '\0') ? "/comics/" : "./";
     char initialDirectory[32];
@@ -1186,6 +1222,7 @@ static int xsc_spawn_file_picker(pid_t *pid, int *readFd) {
     if (rc == ENOENT || rc == EACCES) {
         rc = posix_spawnp(pid, kdialog[0], &actions, NULL, kdialog, environ);
     }
+#endif
     if (rc == 0) {
         *readFd = fds[0];
         fds[0] = -1;
@@ -1247,7 +1284,7 @@ static void xsc_sdl_wakeup(void) {
 - (XSCScreenshotState)screenshotState;
 - (XSCString *)screenshotError;
 - (void)closeFilePicker;
-- (bool)captureScreenshotToPath:(const char *)path;
+- (bool)captureScreenshotToPath:(const char *)path mode:(mode_t)mode;
 
 @end
 
@@ -1497,9 +1534,13 @@ static void xsc_sdl_wakeup(void) {
     int rc = xsc_spawn_file_picker(&_filePickerPID, &_filePickerReadFd);
     if (rc != 0) {
         _filePickerPID = 0;
-        _errorBanner = rc == ENOENT
+        _errorBanner =
+#ifndef __APPLE__
+            rc == ENOENT
             ? [XSCString stringWithUTF8:"Install zenity or kdialog to browse files, or drag a comic here."]
-            : [XSCString stringWithFormat:"Could not open the file picker: %s", strerror(rc)];
+            :
+#endif
+            [XSCString stringWithFormat:"Could not open the file picker: %s", strerror(rc)];
         _needsRedraw = true;
     }
 }
@@ -1666,10 +1707,16 @@ static void xsc_sdl_wakeup(void) {
 
 #pragma mark - Input Handling
 
+#ifdef __APPLE__
+static const SDL_Keymod kXSCShortcutModifier = KMOD_GUI;
+#else
+static const SDL_Keymod kXSCShortcutModifier = KMOD_CTRL;
+#endif
+
 - (void)handleKeyDown:(const SDL_KeyboardEvent *)kev {
     SDL_Keycode key = kev->keysym.sym;
     Uint16 mod = kev->keysym.mod;
-    bool ctrl  = (mod & KMOD_CTRL) != 0;
+    bool ctrl  = (mod & kXSCShortcutModifier) != 0;
     bool shift = (mod & KMOD_SHIFT) != 0;
     bool alt   = (mod & KMOD_ALT) != 0;
 
@@ -2433,7 +2480,11 @@ static const uint64_t kXSCCaretHalfPeriodMs = 530u;
                   inRect:L->emptyOpenBtn
                    color:kColTextWhite];
 
+#ifdef __APPLE__
+    const char *hint = "Drop a comic archive or folder here \xC2\xB7 Press Cmd+O to open";
+#else
     const char *hint = "Drop a comic archive or folder here \xC2\xB7 Press Ctrl+O to open";
+#endif
     float hintMaxW = card.width - 24.0f;
     if ([ui measureTextWidth:hint font:XSCFontSmall11] <= hintMaxW) {
         [ui drawTextCentered:hint
@@ -2678,7 +2729,7 @@ static const uint64_t kXSCCaretHalfPeriodMs = 530u;
     return _hasDisplayedStatus ? [XSCString stringWithUTF8:"The requested page could not be decoded."] : nil;
 }
 
-- (bool)captureScreenshotToPath:(const char *)path {
+- (bool)captureScreenshotToPath:(const char *)path mode:(mode_t)mode {
     [self syncWindowMetrics];
     [self renderSceneToBackbuffer];
 
@@ -2691,7 +2742,7 @@ static const uint64_t kXSCCaretHalfPeriodMs = 530u;
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, _drawableW, _drawableH, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 
-    return xsc_write_rgba_png(path, _drawableW, _drawableH, pixels);
+    return xsc_write_rgba_png(path, mode, _drawableW, _drawableH, pixels);
 }
 
 @end
@@ -2850,6 +2901,14 @@ int main(int argc, char *argv[]) {
     XSCCLIResult parsed = xsc_parse_cli(argc, argv, &opts);
     if (parsed != XSCCLIRun) return parsed == XSCCLIHelp ? 0 : 2;
 
+    // Capture the output mode before SDL or the reader can start threads.
+    mode_t screenshotMode = 0;
+    if (opts.screenshotPath) {
+        mode_t mask = umask(0);
+        umask(mask);
+        screenshotMode = (mode_t)(0666 & ~mask);
+    }
+
     // Enable UTF-8 LC_CTYPE (without touching LC_NUMERIC) so X11's
     // Xutf8TextListToTextProperty updates _NET_WM_NAME for non-ASCII titles.
     const char *ctype = setlocale(LC_CTYPE, "");
@@ -2861,6 +2920,7 @@ int main(int argc, char *argv[]) {
 
     xsc_mark_main_thread();
 
+    SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "xscomic: SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -2877,8 +2937,14 @@ int main(int argc, char *argv[]) {
     xsc_set_main_wakeup(xsc_sdl_wakeup);
     defer { xsc_set_main_wakeup(NULL); }
 
+#ifdef __APPLE__
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+#endif
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
@@ -2888,7 +2954,8 @@ int main(int argc, char *argv[]) {
 
     int initW = (opts.startWidth >= kXSCMinWindowW) ? opts.startWidth : kXSCDefaultWindowW;
     int initH = (opts.startHeight >= kXSCMinWindowH) ? opts.startHeight : kXSCDefaultWindowH;
-    Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE;
+    if (!opts.screenshotPath) winFlags |= SDL_WINDOW_ALLOW_HIGHDPI;
     SDL_Window *window = SDL_CreateWindow("xsComic",
                                           SDL_WINDOWPOS_CENTERED,
                                           SDL_WINDOWPOS_CENTERED,
@@ -2907,7 +2974,7 @@ int main(int argc, char *argv[]) {
 
     SDL_GLContext glCtx = SDL_GL_CreateContext(window);
     if (!glCtx) {
-        fprintf(stderr, "xscomic: OpenGL 3.3 Core context creation failed: %s\n", SDL_GetError());
+        fprintf(stderr, "xscomic: OpenGL core context creation failed: %s\n", SDL_GetError());
         return 1;
     }
     defer { SDL_GL_DeleteContext(glCtx); }
@@ -2976,7 +3043,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 if (state == XSCScreenshotReady) {
-                    if ([app captureScreenshotToPath:opts.screenshotPath]) {
+                    if ([app captureScreenshotToPath:opts.screenshotPath mode:screenshotMode]) {
                         exitCode = 0;
                     } else {
                         fprintf(stderr, "xscomic: failed to write screenshot to %s\n", opts.screenshotPath);

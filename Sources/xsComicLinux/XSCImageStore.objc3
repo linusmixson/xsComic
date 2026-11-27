@@ -1132,21 +1132,6 @@ static XSCDecodedPage *XSCDecodeGIF(XSCData *rawData) {
         memcpy(background, (uint8_t[]){color.Red, color.Green, color.Blue, 255u}, 4u);
     }
     const uint8_t transparent[4] = {0};
-    bool hasAnyTransparency = false;
-    for (size_t f = 0u; f < frameCount; f++) {
-        GraphicsControlBlock probe;
-        probe.DisposalMode = DISPOSAL_UNSPECIFIED;
-        probe.UserInputFlag = false;
-        probe.DelayTime = 0;
-        probe.TransparentColor = NO_TRANSPARENT_COLOR;
-        if (DGifSavedExtensionToGCB(gif, (int)f, &probe) == GIF_OK &&
-            probe.TransparentColor != NO_TRANSPARENT_COLOR) {
-            hasAnyTransparency = true;
-            break;
-        }
-    }
-    const uint8_t *clearColor = hasAnyTransparency ? transparent : background;
-    XSCGIFFill(canvas, canvasW * canvasH, clearColor);
     size_t frameBytes = outBuf.bytesPerRow * canvasH;
 
     for (size_t f = 0u; f < frameCount; f++) {
@@ -1171,6 +1156,8 @@ static XSCDecodedPage *XSCDecodeGIF(XSCData *rawData) {
         if (!hasPlayCount) {
             hasPlayCount = XSCGIFGetPlayCount(img->ExtensionBlocks, img->ExtensionBlockCount, &playCount);
         }
+        const uint8_t *clearColor = gcb.TransparentColor == NO_TRANSPARENT_COLOR ? background : transparent;
+        if (f == 0u) XSCGIFFill(canvas, canvasW * canvasH, clearColor);
 
         if (gcb.DisposalMode == DISPOSE_PREVIOUS) {
             if (!prevCanvas) {

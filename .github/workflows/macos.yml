@@ -2,13 +2,13 @@ name: macOS native app
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, port_slopjective_c]
   push:
-    branches: [master]
+    branches: [master, port_slopjective_c]
   workflow_dispatch:
     inputs:
       runner:
-        description: GitHub-hosted Apple Silicon image
+        description: GitHub-hosted Apple Silicon image (macos-15 by default)
         type: choice
         options:
           - macos-15

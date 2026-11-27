@@ -10,7 +10,7 @@ native macOS AppKit/Metal implementation, see [guide.md](guide.md).
 xsComic on Linux targets `aarch64-unknown-linux-gnu` and
 `x86_64-unknown-linux-gnu` (verified on Debian 13) and compiles directly with
 the official **Slopjective-C** (`doublemover/Slopjective-C`,
-`v0.1.0-preview.1`) **`objc3c`** compiler — patched LLVM/Clang 23.1.5 targeting
+`v0.1.0-preview.2`) **`objc3c`** compiler — patched LLVM/Clang 23.1.5 targeting
 the GNUstep 2.2 ABI and `libobjc2` (`libobjc.so.4.6`) with ARC and Blocks
 enabled.
 
@@ -257,9 +257,10 @@ build/linux/xscomic [options] [book_path]
   --screenshot PATH   Render frame, save PNG to PATH, and exit
 ```
 
-With a book path, `--screenshot` waits for the requested spread to render.
-Opening, decoding, and output errors return a nonzero status. With no book,
-it captures the empty reader. Invalid command-line arguments exit with status 2.
+With a book path, `--screenshot` waits up to 30 seconds for the requested spread.
+It writes the completed PNG using the caller’s `umask`. Opening, decoding,
+timeout, and output errors return a nonzero status. With no book, it captures
+the empty reader. Invalid command-line arguments exit with status 2.
 
 ## Measured footprint and benchmarks
 
