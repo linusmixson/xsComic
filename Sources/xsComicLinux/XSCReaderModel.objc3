@@ -1,0 +1,925 @@
+#include "XSCReaderModel.h"
+
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ XSCReaderModel keeps all reading-session state on the main queue while
+ keeping archive I/O and image decoding completely off-main.
+
+ Four design invariants drive its latency and memory characteristics:
+
+   1. Archive-order navigation: `currentIndex` always advances 0 ..< pageCount
+      and stays aligned to `currentIndex % step == 0`. RTL reverses only the
+      visual left/right pair returned by `visualPageIndices`, so prefetch,
+      history, and volume continuation never branch on reading direction.
+
+   2. Zero-hop synchronous cache-hit fast path: on every page turn, the model
+      queries `XSCImageStore.cachedPageForBook:index:` directly under a lock
+      (~100 ns). When the visible spread is already decoded, the delegate
+      updates the canvas synchronously in the exact same turn — guaranteeing
+      instant turns with zero intermediate blank or spinner frames.
+
+   3. 120 ms loading grace timer: on a cold cache miss, the previous spread
+      remains on screen briefly while the priority decode lane runs. Only if
+      decoding still has not finished after 120 ms does the model reveal the
+      "Loading page…" status overlay.
+
+   4. Predictive adjacent-volume pre-warming: when `continueAcrossVolumes` is
+      enabled and the reader comes within 3 pages of either volume boundary,
+      the model discovers, opens, and pre-decodes the boundary page(s) of the
+      neighboring volume off-main so crossing volumes swaps synchronously.
+ */
+
+static const size_t kXSCForwardPrefetchCount = 8u;
+static const size_t kXSCBackwardBufferCount = 2u;
+static const uint64_t kXSCLoadingGraceMs = 120ULL;
+
+/// Lightweight ARC-managed cancellation flag safe to share across worker threads.
+@interface XSCCancelToken : XSCObject {
+    _Atomic(bool) _flag;
+}
+- (const _Atomic(bool) *)flagPointer;
+- (bool)isCancelled;
+- (void)cancel;
+@end
+
+@implementation XSCCancelToken
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        atomic_init(&_flag, false);
+    }
+    return self;
+}
+
+- (const _Atomic(bool) *)flagPointer {
+    return &_flag;
+}
+
+- (bool)isCancelled {
+    return atomic_load_explicit(&_flag, memory_order_acquire);
+}
+
+- (void)cancel {
+    atomic_store_explicit(&_flag, true, memory_order_release);
+}
+
+@end
+
+@implementation XSCReaderModel {
+    __weak id<XSCReaderModelDelegate> _delegate;
+    XSCImageStore *_imageStore;
+    XSCOptBook _book;
+    size_t _currentIndex;
+    XSCReadingDirection _direction;
+    XSCPageMode _pageMode;
+    bool _isLoading;
+    XSCOptString _errorMessage;
+    uint8_t _consecutiveBackwardTurns;
+
+    uint64_t _openGeneration;
+    XSCCancelToken *_openCancelToken;
+
+    uint64_t _displayGeneration;
+    bool _displayResolved;
+    XSCOptDecodedPage _displayedLeftPage;
+    XSCOptDecodedPage _displayedRightPage;
+
+    // Predictive adjacent-volume pre-warming (at most 1 next + 1 prev book).
+    XSCOptBook _prewarmedNextBook;
+    XSCOptBook _prewarmedPrevBook;
+    XSCCancelToken *_prewarmNextToken;
+    XSCCancelToken *_prewarmPrevToken;
+    uint64_t _prewarmNextBookID;
+    uint64_t _prewarmPrevBookID;
+
+    // Guards against duplicate on-demand adjacent lookups on repeated boundary presses.
+    bool _adjacentLookupInFlight;
+    XSCCancelToken *_adjacentLookupToken;
+}
+
+#pragma mark - Lifecycle & Property Accessors
+
+- (instancetype)init {
+    return [self initWithImageStore:[[XSCImageStore alloc] init]];
+}
+
+- (instancetype)initWithImageStore:(XSCImageStore *)imageStore {
+    self = [super init];
+    if (self) {
+        _imageStore = imageStore;
+        _book = None(XSCBook *);
+        _currentIndex = 0u;
+        _direction = XSCReadingDirectionLTR;
+        _pageMode = XSCPageModeSingle;
+        _isLoading = false;
+        _errorMessage = None(XSCString *);
+        _consecutiveBackwardTurns = 0u;
+
+        _displayedLeftPage = None(XSCDecodedPage *);
+        _displayedRightPage = None(XSCDecodedPage *);
+        _prewarmedNextBook = None(XSCBook *);
+        _prewarmedPrevBook = None(XSCBook *);
+    }
+    return self;
+}
+
+- (void)dealloc {
+    [self cancelBackgroundWork];
+}
+
+- (void)cancelBackgroundWork {
+    [_openCancelToken cancel];
+    [_prewarmNextToken cancel];
+    [_prewarmPrevToken cancel];
+    [_adjacentLookupToken cancel];
+}
+
+- (id<XSCReaderModelDelegate>)delegate {
+    return _delegate;
+}
+
+- (void)setDelegate:(id<XSCReaderModelDelegate>)delegate {
+    _delegate = delegate;
+    if (delegate != nil) {
+        [self presentCurrentSpreadWithContinueAcrossVolumes:false];
+    }
+}
+
+- (XSCImageStore *)imageStore {
+    return _imageStore;
+}
+
+- (XSCOptBook)book {
+    return _book;
+}
+
+- (size_t)currentIndex {
+    return _currentIndex;
+}
+
+- (XSCReadingDirection)direction {
+    return _direction;
+}
+
+- (XSCPageMode)pageMode {
+    return _pageMode;
+}
+
+- (bool)isLoading {
+    return _isLoading;
+}
+
+- (XSCOptString)errorMessage {
+    return _errorMessage;
+}
+
+- (uint8_t)consecutiveBackwardTurns {
+    return _consecutiveBackwardTurns;
+}
+
+#pragma mark - Derived Geometry & Indicators
+
+- (size_t)step {
+    return (_pageMode == XSCPageModeDouble) ? 2u : 1u;
+}
+
+- (XSCIndexList *)visualPageIndices {
+    match(_book) {
+        case .None: {
+            return [XSCIndexList emptyList];
+        }
+        case .Some(let book): {
+            size_t pageCount = book.pageCount;
+            if (pageCount == 0u || _currentIndex >= pageCount) {
+                return [XSCIndexList emptyList];
+            }
+            if (_pageMode == XSCPageModeSingle || _currentIndex + 1u >= pageCount) {
+                size_t vals[1] = { _currentIndex };
+                return [XSCIndexList listWithValues:vals count:1u];
+            }
+            if (_direction == XSCReadingDirectionRTL) {
+                size_t vals[2] = { _currentIndex + 1u, _currentIndex };
+                return [XSCIndexList listWithValues:vals count:2u];
+            }
+            size_t vals[2] = { _currentIndex, _currentIndex + 1u };
+            return [XSCIndexList listWithValues:vals count:2u];
+        }
+    }
+}
+
+- (XSCString *)pageIndicatorText {
+    match(_book) {
+        case .None: {
+            return [XSCString emptyString];
+        }
+        case .Some(let book): {
+            size_t pageCount = book.pageCount;
+            if (pageCount == 0u || _currentIndex >= pageCount) {
+                return [XSCString emptyString];
+            }
+            size_t start = _currentIndex + 1u;
+            size_t step = [self step];
+            size_t end = (_currentIndex < pageCount && pageCount - _currentIndex > step)
+                ? (_currentIndex + step)
+                : pageCount;
+            if (start == end) {
+                return [XSCString stringWithFormat:"%zu / %zu", start, pageCount];
+            }
+            return [XSCString stringWithFormat:"%zu\xe2\x80\x93%zu / %zu", start, end, pageCount];
+        }
+    }
+}
+
+#pragma mark - Prefetch Predictor
+
+/*
+ Bounded 8-ahead / 2-behind prefetch ordering with a 1-byte saturating
+ reverse-reading predictor (`consecutiveBackwardTurns` in 0..2).
+
+ A single backward turn is usually a brief check or correction, so prefetch
+ stays forward-first. Two consecutive backward turns indicate sustained
+ rereading and prioritize the 2 preceding pages ahead of the 8 upcoming pages
+ without expanding the cache window or memory budget.
+ */
++ (XSCIndexList *)prefetchOrderForCurrentIndex:(size_t)currentIndex
+                                     pageCount:(size_t)pageCount
+                                      pageMode:(XSCPageMode)pageMode
+                      consecutiveBackwardTurns:(uint8_t)backwardTurns {
+    if (pageCount == 0u || currentIndex >= pageCount) {
+        return [XSCIndexList emptyList];
+    }
+    size_t step = (pageMode == XSCPageModeDouble) ? 2u : 1u;
+    size_t visibleEnd = (pageCount - currentIndex > step) ? (currentIndex + step) : pageCount;
+    size_t nextEnd = (pageCount - visibleEnd > kXSCForwardPrefetchCount)
+        ? (visibleEnd + kXSCForwardPrefetchCount)
+        : pageCount;
+    size_t prevStart = (currentIndex > kXSCBackwardBufferCount)
+        ? (currentIndex - kXSCBackwardBufferCount)
+        : 0u;
+
+    size_t buf[kXSCForwardPrefetchCount + kXSCBackwardBufferCount];
+    size_t count = 0u;
+
+    if (backwardTurns >= 2u) {
+        for (size_t i = currentIndex; i > prevStart; i--) {
+            buf[count++] = i - 1u;
+        }
+        for (size_t i = visibleEnd; i < nextEnd; i++) {
+            buf[count++] = i;
+        }
+    } else {
+        for (size_t i = visibleEnd; i < nextEnd; i++) {
+            buf[count++] = i;
+        }
+        for (size_t i = currentIndex; i > prevStart; i--) {
+            buf[count++] = i - 1u;
+        }
+    }
+    return [XSCIndexList listWithValues:buf count:count];
+}
+
+#pragma mark - Opening & Replacing Books
+
+- (void)openPath:(const char *)path {
+    [self openPath:path startAtEnd:false];
+}
+
+- (void)openPath:(const char *)path startAtEnd:(bool)startAtEnd {
+    if (!path) return;
+
+    XSCString *ownedPath = [XSCString stringWithUTF8:path];
+
+    _openGeneration += 1ULL;
+    uint64_t generation = _openGeneration;
+
+    // Invalidate any in-flight cold page decode or 120 ms grace timer from the
+    // previous book so a late callback cannot overwrite the "Opening book…" state.
+    _displayGeneration += 1ULL;
+    _displayResolved = true;
+
+    [_openCancelToken cancel];
+    [_adjacentLookupToken cancel];
+    _adjacentLookupToken = nil;
+    _adjacentLookupInFlight = false;
+    [self clearPrewarmedVolumes];
+
+    XSCCancelToken *token = [[XSCCancelToken alloc] init];
+    _openCancelToken = token;
+
+    _isLoading = true;
+    _errorMessage = None(XSCString *);
+
+    // Notify delegate so toolbar/loading UI updates immediately.
+    id<XSCReaderModelDelegate> del = _delegate;
+    if (del != nil) {
+        [del readerModelDidUpdateState:self];
+    }
+    del = _delegate;
+    if (del != nil) {
+        [del readerModel:self
+         displayLeftPage:_displayedLeftPage
+               rightPage:_displayedRightPage
+            showEmptyCTA:false
+               isLoading:true
+              statusText:Some(XSCString *, [XSCString stringWithUTF8:"Opening book\xe2\x80\xa6"])];
+    }
+
+    __weak XSCReaderModel *weakSelf = self;
+    xsc_dispatch_bg(^{
+        XSCOptBook loadedOpt = None(XSCBook *);
+        XSCError *openError = nil;
+        handle {
+            XSCBook *opened = tryValue([XSCBook openPath:ownedPath.utf8
+                                              cancelFlag:[token flagPointer]]);
+            if (opened != nil) {
+                loadedOpt = Some(XSCBook *, opened);
+            }
+        } catch(XSCError *err) {
+            openError = err;
+        }
+
+        xsc_dispatch_main(^{
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+            if (generation != strongSelf->_openGeneration || [token isCancelled]) {
+                return;
+            }
+            strongSelf->_openCancelToken = nil;
+
+            match(loadedOpt) {
+                case .None: {
+                    strongSelf->_isLoading = false;
+                    bool isCancelled = (openError != nil
+                        && openError.domain == XSCErrorDomainArchive
+                        && openError.code == XSCArchiveErrorCancelled);
+                    if (!isCancelled) {
+                        XSCString *msg = (openError != nil && openError.message.length > 0u)
+                            ? openError.message
+                            : [XSCString stringWithUTF8:"The archive could not be opened."];
+                        strongSelf->_errorMessage = Some(XSCString *, msg);
+                    }
+                    [strongSelf presentCurrentSpreadWithContinueAcrossVolumes:false];
+                }
+                case .Some(let loaded): {
+                    [strongSelf commitLoadedBook:loaded
+                                      startAtEnd:startAtEnd
+                                     keepInCache:false
+                           continueAcrossVolumes:false];
+                }
+            }
+        });
+    });
+}
+
+- (void)commitLoadedBook:(XSCBook *)loaded
+              startAtEnd:(bool)startAtEnd
+             keepInCache:(bool)keepInCache
+   continueAcrossVolumes:(bool)continueAcrossVolumes {
+    XSCOptBook keepOpt = keepInCache ? Some(XSCBook *, loaded) : None(XSCBook *);
+    [_imageStore resetKeepingBook:keepOpt];
+
+    _book = Some(XSCBook *, loaded);
+    _errorMessage = None(XSCString *);
+    _isLoading = false;
+    _consecutiveBackwardTurns = 0u;
+
+    size_t pageCount = loaded.pageCount;
+    if (startAtEnd && pageCount > 0u) {
+        size_t lastIndex = pageCount - 1u;
+        size_t step = [self step];
+        _currentIndex = lastIndex - (lastIndex % step);
+    } else {
+        _currentIndex = 0u;
+    }
+
+    [self presentCurrentSpreadWithContinueAcrossVolumes:continueAcrossVolumes];
+}
+
+#pragma mark - Navigation
+
+- (void)turnPageForKey:(XSCPageTurnKey)key
+   swapRTLPageTurnKeys:(bool)swapRTL
+ continueAcrossVolumes:(bool)continueAcrossVolumes {
+    bool leftGoesForward = (_direction == XSCReadingDirectionRTL && !swapRTL);
+    bool goForward = (key == XSCPageTurnKeyLeft) ? leftGoesForward : !leftGoesForward;
+    if (goForward) {
+        [self goForwardContinueAcrossVolumes:continueAcrossVolumes];
+    } else {
+        [self goBackwardContinueAcrossVolumes:continueAcrossVolumes];
+    }
+}
+
+- (void)goForwardContinueAcrossVolumes:(bool)continueAcrossVolumes {
+    if (_isLoading) return;
+    match(_book) {
+        case .None: { return; }
+        case .Some(let book): {
+            size_t pageCount = book.pageCount;
+            if (pageCount == 0u) return;
+
+            size_t step = [self step];
+            if (_currentIndex < pageCount && pageCount - _currentIndex > step) {
+                size_t nextIdx = _currentIndex + step;
+                _currentIndex = (nextIdx < pageCount - 1u) ? nextIdx : (pageCount - 1u);
+                _consecutiveBackwardTurns = 0u;
+                [self presentCurrentSpreadWithContinueAcrossVolumes:continueAcrossVolumes];
+                return;
+            }
+
+            if (continueAcrossVolumes) {
+                [self crossToAdjacentVolumeForward:true];
+            }
+        }
+    }
+}
+
+- (void)goBackwardContinueAcrossVolumes:(bool)continueAcrossVolumes {
+    if (_isLoading) return;
+    match(_book) {
+        case .None: { return; }
+        case .Some(let book): {
+            if (book.pageCount == 0u) return;
+
+            if (_currentIndex > 0u) {
+                size_t step = [self step];
+                _currentIndex = (_currentIndex >= step) ? (_currentIndex - step) : 0u;
+                if (_consecutiveBackwardTurns < 2u) {
+                    _consecutiveBackwardTurns += 1u;
+                }
+                [self presentCurrentSpreadWithContinueAcrossVolumes:continueAcrossVolumes];
+                return;
+            }
+
+            if (continueAcrossVolumes) {
+                [self crossToAdjacentVolumeForward:false];
+            }
+        }
+    }
+}
+
+- (bool)jumpToOneBasedPageNumber:(int64_t)pageNumber {
+    if (_isLoading || pageNumber < 1) {
+        return false;
+    }
+    match(_book) {
+        case .None: {
+            return false;
+        }
+        case .Some(let book): {
+            uint64_t oneBased = (uint64_t)pageNumber;
+            if (oneBased > (uint64_t)book.pageCount) {
+                return false;
+            }
+            size_t index = (size_t)(oneBased - 1ULL);
+            size_t step = [self step];
+            _currentIndex = index - (index % step);
+            _consecutiveBackwardTurns = 0u;
+            [self presentCurrentSpreadWithContinueAcrossVolumes:false];
+            return true;
+        }
+    }
+}
+
+- (void)toggleDirection {
+    _direction = (_direction == XSCReadingDirectionLTR)
+        ? XSCReadingDirectionRTL
+        : XSCReadingDirectionLTR;
+    [self presentCurrentSpreadWithContinueAcrossVolumes:false];
+}
+
+- (void)togglePageMode {
+    _pageMode = (_pageMode == XSCPageModeSingle)
+        ? XSCPageModeDouble
+        : XSCPageModeSingle;
+    size_t step = [self step];
+    _currentIndex -= (_currentIndex % step);
+    _consecutiveBackwardTurns = 0u;
+    [self presentCurrentSpreadWithContinueAcrossVolumes:false];
+}
+
+#pragma mark - Predictive Volume Pre-Warming & Boundary Crossing
+
+/*
+ Entering the final (or initial) 3 pages of a volume with continuation enabled
+ triggers off-main discovery + open of the sibling volume, plus pre-decoding
+ its boundary spread into XSCImageStore. When the user crosses the boundary,
+ the new XSCBook swaps in synchronously (< 0.2 ms) and the old book slides into
+ the opposite pre-warm slot for instant back-crossing.
+ */
+- (void)clearPrewarmedVolumes {
+    [_prewarmNextToken cancel];
+    [_prewarmPrevToken cancel];
+    _prewarmNextToken = nil;
+    _prewarmPrevToken = nil;
+    _prewarmedNextBook = None(XSCBook *);
+    _prewarmedPrevBook = None(XSCBook *);
+    _prewarmNextBookID = 0ULL;
+    _prewarmPrevBookID = 0ULL;
+}
+
+- (void)maybePrewarmAdjacentVolumes {
+    match(_book) {
+        case .None: { return; }
+        case .Some(let book): {
+            size_t pageCount = book.pageCount;
+            if (pageCount == 0u) return;
+
+            size_t step = [self step];
+            size_t remainingAfter = (_currentIndex < pageCount && pageCount - _currentIndex > step)
+                ? (pageCount - (_currentIndex + step))
+                : 0u;
+            if (remainingAfter <= 3u && _prewarmNextBookID != book.bookID) {
+                [self startPrewarmAdjacentForward:true forBook:book];
+            }
+            if (_currentIndex <= 3u && _prewarmPrevBookID != book.bookID) {
+                [self startPrewarmAdjacentForward:false forBook:book];
+            }
+        }
+    }
+}
+
+- (void)startPrewarmAdjacentForward:(bool)forward forBook:(XSCBook *)book {
+    XSCString *sourcePath = book.sourcePath;
+    if (sourcePath == nil || sourcePath.length == 0u) return;
+
+    uint64_t expectedBookID = book.bookID;
+    XSCCancelToken *token = [[XSCCancelToken alloc] init];
+
+    if (forward) {
+        [_prewarmNextToken cancel];
+        _prewarmNextToken = token;
+        _prewarmNextBookID = expectedBookID;
+        _prewarmedNextBook = None(XSCBook *);
+    } else {
+        [_prewarmPrevToken cancel];
+        _prewarmPrevToken = token;
+        _prewarmPrevBookID = expectedBookID;
+        _prewarmedPrevBook = None(XSCBook *);
+    }
+
+    int dirStep = forward ? 1 : -1;
+    XSCPageMode modeAtStart = _pageMode;
+    __weak XSCReaderModel *weakSelf = self;
+
+    xsc_dispatch_bg(^{
+        XSCOptString adjPathOpt = [XSCBook adjacentVolumePathFor:sourcePath.utf8
+                                                            step:dirStep
+                                                      cancelFlag:[token flagPointer]];
+        if ([token isCancelled]) return;
+
+        XSCString *adjPath = match(adjPathOpt) {
+            case .Some(let p) => p;
+            case .None => (XSCString *)nil;
+        };
+        if (adjPath == nil) return;
+
+        XSCBook *adjBook = nil;
+        handle {
+            adjBook = tryValue([XSCBook openPath:adjPath.utf8
+                                      cancelFlag:[token flagPointer]]);
+        } catch(XSCError *err) {
+            (void)err;
+            return;
+        }
+        if (adjBook == nil || adjBook.pageCount == 0u || [token isCancelled]) return;
+
+        xsc_dispatch_main(^{
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil || [token isCancelled]) return;
+
+            bool sameBook = match(strongSelf->_book) {
+                case .Some(let cur) => (cur.bookID == expectedBookID);
+                case .None => false;
+            };
+            if (!sameBook) return;
+
+            if (forward) {
+                strongSelf->_prewarmedNextBook = Some(XSCBook *, adjBook);
+                [strongSelf->_imageStore prewarmPageForBook:adjBook index:0u];
+                if (modeAtStart == XSCPageModeDouble && adjBook.pageCount > 1u) {
+                    [strongSelf->_imageStore prewarmPageForBook:adjBook index:1u];
+                }
+            } else {
+                strongSelf->_prewarmedPrevBook = Some(XSCBook *, adjBook);
+                size_t step = (modeAtStart == XSCPageModeDouble) ? 2u : 1u;
+                size_t lastIndex = adjBook.pageCount - 1u;
+                size_t startIdx = lastIndex - (lastIndex % step);
+                [strongSelf->_imageStore prewarmPageForBook:adjBook index:startIdx];
+                if (step == 2u && startIdx + 1u < adjBook.pageCount) {
+                    [strongSelf->_imageStore prewarmPageForBook:adjBook index:startIdx + 1u];
+                }
+            }
+        });
+    });
+}
+
+- (void)crossToAdjacentVolumeForward:(bool)forward {
+    XSCBook *currentBook = match(_book) {
+        case .Some(let b) => b;
+        case .None => (XSCBook *)nil;
+    };
+    if (currentBook == nil) return;
+
+    // Fast path: pre-warmed adjacent volume is already open (and boundary page pre-decoded).
+    XSCOptBook prewarmedOpt = forward ? _prewarmedNextBook : _prewarmedPrevBook;
+    match(prewarmedOpt) {
+        case .Some(let prewarmed): {
+            [_openCancelToken cancel];
+            _openCancelToken = nil;
+            [_adjacentLookupToken cancel];
+            _adjacentLookupToken = nil;
+            _adjacentLookupInFlight = false;
+            _openGeneration += 1ULL;
+
+            [_prewarmNextToken cancel];
+            [_prewarmPrevToken cancel];
+            _prewarmNextToken = nil;
+            _prewarmPrevToken = nil;
+
+            // Retain the book we just left as the opposite-direction prewarmed slot!
+            if (forward) {
+                _prewarmedPrevBook = Some(XSCBook *, currentBook);
+                _prewarmPrevBookID = prewarmed.bookID;
+                _prewarmedNextBook = None(XSCBook *);
+                _prewarmNextBookID = 0ULL;
+            } else {
+                _prewarmedNextBook = Some(XSCBook *, currentBook);
+                _prewarmNextBookID = prewarmed.bookID;
+                _prewarmedPrevBook = None(XSCBook *);
+                _prewarmPrevBookID = 0ULL;
+            }
+
+            [self commitLoadedBook:prewarmed
+                        startAtEnd:!forward
+                       keepInCache:true
+             continueAcrossVolumes:true];
+            return;
+        }
+        case .None: {}
+    }
+
+    // Fallback: discover neighbor off-main WITHOUT flashing the canvas spinner at series end,
+    // while marking model.isLoading = true so concurrent turns and async waiters serialize cleanly.
+    if (_adjacentLookupInFlight) return;
+    XSCString *sourcePath = currentBook.sourcePath;
+    if (sourcePath == nil || sourcePath.length == 0u) return;
+
+    _adjacentLookupInFlight = true;
+    _isLoading = true;
+
+    uint64_t expectedBookID = currentBook.bookID;
+    int dirStep = forward ? 1 : -1;
+
+    XSCCancelToken *token = [[XSCCancelToken alloc] init];
+    _adjacentLookupToken = token;
+    __weak XSCReaderModel *weakSelf = self;
+
+    xsc_dispatch_bg(^{
+        XSCOptString adjPathOpt = [XSCBook adjacentVolumePathFor:sourcePath.utf8
+                                                            step:dirStep
+                                                      cancelFlag:[token flagPointer]];
+        xsc_dispatch_main(^{
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+
+            defer {
+                if (strongSelf->_adjacentLookupToken == token) {
+                    strongSelf->_adjacentLookupInFlight = false;
+                    strongSelf->_adjacentLookupToken = nil;
+                }
+            }
+
+            bool sameBook = match(strongSelf->_book) {
+                case .Some(let cur) => (cur.bookID == expectedBookID);
+                case .None => false;
+            };
+            if ([token isCancelled] || !sameBook) {
+                return;
+            }
+
+            match(adjPathOpt) {
+                case .None: {
+                    // End of series: stay put silently without destroying the canvas.
+                    strongSelf->_isLoading = false;
+                    id<XSCReaderModelDelegate> del = strongSelf->_delegate;
+                    if (del != nil) {
+                        [del readerModelDidUpdateState:strongSelf];
+                    }
+                }
+                case .Some(let adjPath): {
+                    [strongSelf openPath:adjPath.utf8 startAtEnd:!forward];
+                }
+            }
+        });
+    });
+}
+
+#pragma mark - Zero-Hop Synchronous Presentation
+
+- (void)presentCurrentSpreadWithContinueAcrossVolumes:(bool)continueAcrossVolumes {
+    _displayGeneration += 1ULL;
+    uint64_t gen = _displayGeneration;
+    _displayResolved = false;
+
+    XSCBook *book = match(_book) {
+        case .Some(let b) => b;
+        case .None => (XSCBook *)nil;
+    };
+    if (book == nil || book.pageCount == 0u) {
+        _displayedLeftPage = None(XSCDecodedPage *);
+        _displayedRightPage = None(XSCDecodedPage *);
+        _displayResolved = true;
+        id<XSCReaderModelDelegate> del = _delegate;
+        if (del != nil) {
+            XSCOptString status = _isLoading
+                ? Some(XSCString *, [XSCString stringWithUTF8:"Opening book\xe2\x80\xa6"])
+                : None(XSCString *);
+            [del readerModel:self
+             displayLeftPage:None(XSCDecodedPage *)
+                   rightPage:None(XSCDecodedPage *)
+                showEmptyCTA:!_isLoading
+                   isLoading:_isLoading
+                  statusText:status];
+        }
+        del = _delegate;
+        if (del != nil) {
+            [del readerModelDidUpdateState:self];
+        }
+        return;
+    }
+
+    defer {
+        if (continueAcrossVolumes) {
+            [self maybePrewarmAdjacentVolumes];
+        }
+    }
+
+    XSCIndexList *visual = self.visualPageIndices;
+    size_t count = visual.count;
+    bool hasLeft = (count >= 1u);
+    bool hasRight = (count >= 2u);
+    size_t leftIdx = hasLeft ? [visual valueAtIndex:0u] : 0u;
+    size_t rightIdx = hasRight ? [visual valueAtIndex:1u] : 0u;
+
+    XSCIndexList *prefetchOrder =
+        [XSCReaderModel prefetchOrderForCurrentIndex:_currentIndex
+                                           pageCount:book.pageCount
+                                            pageMode:_pageMode
+                            consecutiveBackwardTurns:_consecutiveBackwardTurns];
+
+    // Zero-hop synchronous lock-protected cache lookup (~100 ns).
+    XSCOptDecodedPage cachedLeft = hasLeft
+        ? [_imageStore cachedPageForBook:book index:leftIdx]
+        : None(XSCDecodedPage *);
+    XSCOptDecodedPage cachedRight = hasRight
+        ? [_imageStore cachedPageForBook:book index:rightIdx]
+        : None(XSCDecodedPage *);
+
+    bool leftReady = !hasLeft || match(cachedLeft) {
+        case .Some(let p) => (p != nil);
+        case .None => false;
+    };
+    bool rightReady = !hasRight || match(cachedRight) {
+        case .Some(let p) => (p != nil);
+        case .None => false;
+    };
+
+    if (leftReady && rightReady) {
+        // 100% cache hit: swap canvas synchronously in this exact turn!
+        _displayResolved = true;
+        _displayedLeftPage = cachedLeft;
+        _displayedRightPage = cachedRight;
+        id<XSCReaderModelDelegate> del = _delegate;
+        if (del != nil) {
+            [del readerModel:self
+             displayLeftPage:cachedLeft
+                   rightPage:cachedRight
+                showEmptyCTA:false
+                   isLoading:false
+                  statusText:None(XSCString *)];
+        }
+        [_imageStore updateRetentionAndPrefetchForBook:book
+                                        visibleIndices:visual
+                                        orderedIndices:prefetchOrder];
+        del = _delegate;
+        if (del != nil) {
+            [del readerModelDidUpdateState:self];
+        }
+        return;
+    }
+
+    // Cache miss on 1 or 2 visible pages: update retention & prefetch, keep last frame briefly,
+    // and reveal loading status ONLY if cold decode exceeds 120 ms grace window.
+    [_imageStore updateRetentionAndPrefetchForBook:book
+                                    visibleIndices:visual
+                                    orderedIndices:prefetchOrder];
+    id<XSCReaderModelDelegate> del = _delegate;
+    if (del != nil) {
+        [del readerModelDidUpdateState:self];
+    }
+
+    __block XSCOptDecodedPage resolvedLeft = cachedLeft;
+    __block XSCOptDecodedPage resolvedRight = cachedRight;
+    __block bool leftDone = leftReady;
+    __block bool rightDone = rightReady;
+    __block bool leftFailed = false;
+    __block bool rightFailed = false;
+
+    __weak XSCReaderModel *weakSelf = self;
+
+    XSCVoidBlock finishIfReady = ^{
+        XSCReaderModel *strongSelf = weakSelf;
+        if (strongSelf == nil) return;
+        if (gen != strongSelf->_displayGeneration) return;
+        if (!leftDone || !rightDone) return;
+
+        strongSelf->_displayResolved = true;
+        bool allFailed = (hasLeft ? leftFailed : true)
+            && (hasRight ? rightFailed : true);
+        id<XSCReaderModelDelegate> activeDel = strongSelf->_delegate;
+        if (allFailed) {
+            strongSelf->_displayedLeftPage = None(XSCDecodedPage *);
+            strongSelf->_displayedRightPage = None(XSCDecodedPage *);
+            if (activeDel != nil) {
+                [activeDel readerModel:strongSelf
+                       displayLeftPage:None(XSCDecodedPage *)
+                             rightPage:None(XSCDecodedPage *)
+                          showEmptyCTA:false
+                             isLoading:false
+                            statusText:Some(XSCString *, [XSCString stringWithUTF8:"Unreadable Image"])];
+            }
+        } else {
+            strongSelf->_displayedLeftPage = resolvedLeft;
+            strongSelf->_displayedRightPage = resolvedRight;
+            if (activeDel != nil) {
+                [activeDel readerModel:strongSelf
+                       displayLeftPage:resolvedLeft
+                             rightPage:resolvedRight
+                          showEmptyCTA:false
+                             isLoading:false
+                            statusText:None(XSCString *)];
+            }
+        }
+    };
+
+    if (!leftDone) {
+        [_imageStore requestPageForBook:book
+                                  index:leftIdx
+                               priority:true
+                             completion:^(XSCOptDecodedPage page, bool failed) {
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil || gen != strongSelf->_displayGeneration) return;
+            bool gotPage = match(page) {
+                case .Some(let p) => (p != nil);
+                case .None => false;
+            };
+            resolvedLeft = gotPage ? page : None(XSCDecodedPage *);
+            leftFailed = (failed || !gotPage);
+            leftDone = true;
+            finishIfReady();
+        }];
+    }
+    if (!rightDone) {
+        [_imageStore requestPageForBook:book
+                                  index:rightIdx
+                               priority:true
+                             completion:^(XSCOptDecodedPage page, bool failed) {
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil || gen != strongSelf->_displayGeneration) return;
+            bool gotPage = match(page) {
+                case .Some(let p) => (p != nil);
+                case .None => false;
+            };
+            resolvedRight = gotPage ? page : None(XSCDecodedPage *);
+            rightFailed = (failed || !gotPage);
+            rightDone = true;
+            finishIfReady();
+        }];
+    }
+
+    if (!_displayResolved) {
+        xsc_dispatch_main_after_ms(kXSCLoadingGraceMs, ^{
+            XSCReaderModel *strongSelf = weakSelf;
+            if (strongSelf == nil) return;
+            if (gen != strongSelf->_displayGeneration || strongSelf->_displayResolved) {
+                return;
+            }
+            id<XSCReaderModelDelegate> activeDel = strongSelf->_delegate;
+            if (activeDel != nil) {
+                [activeDel readerModel:strongSelf
+                       displayLeftPage:strongSelf->_displayedLeftPage
+                             rightPage:strongSelf->_displayedRightPage
+                          showEmptyCTA:false
+                             isLoading:true
+                            statusText:Some(XSCString *, [XSCString stringWithUTF8:"Loading page\xe2\x80\xa6"])];
+            }
+        });
+    }
+}
+
+@end

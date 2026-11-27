@@ -1,0 +1,2653 @@
+#include "XSCBase.h"
+#include "XSCArchive.h"
+#include "XSCImageStore.h"
+#include "XSCReaderModel.h"
+
+#include <fcntl.h>
+#include <archive.h>
+#include <archive_entry.h>
+#include <errno.h>
+#include <jpeglib.h>
+#include <limits.h>
+#include <png.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <zlib.h>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
+static int gPassCount = 0;
+static int gFailCount = 0;
+
+#define XSC_ASSERT(cond, fmt, ...)                                                   \
+    do {                                                                             \
+        if (cond) {                                                                  \
+            gPassCount++;                                                            \
+        } else {                                                                     \
+            gFailCount++;                                                            \
+            fprintf(stderr, "  [FAIL] %s:%d: " fmt "\n", __func__, __LINE__,         \
+                    ##__VA_ARGS__);                                                  \
+        }                                                                            \
+    } while (0)
+
+static double nowMilliseconds(void) {
+    return xsc_now_ms();
+}
+
+static uint64_t currentRssBytes(void) {
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                     (task_info_t)&info, &count);
+    return result == KERN_SUCCESS ? (uint64_t)info.resident_size : 0ULL;
+#else
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0ULL;
+    defer { fclose(f); }
+    unsigned long long sizePages = 0ULL;
+    unsigned long long rssPages = 0ULL;
+    if (fscanf(f, "%llu %llu", &sizePages, &rssPages) != 2) {
+        return 0ULL;
+    }
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pageSize <= 0) pageSize = 4096;
+    return (uint64_t)rssPages * (uint64_t)pageSize;
+#endif
+}
+
+#pragma mark - Minimal Byte Buffer & File Helpers
+
+typedef struct XSCByteBuf {
+    uint8_t *data;
+    size_t len;
+    size_t cap;
+} XSCByteBuf;
+
+static void xscBufFree(XSCByteBuf *b) {
+    if (!b) return;
+    free(b->data);
+    b->data = NULL;
+    b->len = 0u;
+    b->cap = 0u;
+}
+
+static bool xscBufReserve(XSCByteBuf *b, size_t extra) {
+    if (extra > SIZE_MAX - b->len) return false;
+    size_t needed = b->len + extra;
+    if (needed <= b->cap) return true;
+    size_t newCap = b->cap ? b->cap : 256u;
+    while (newCap < needed) {
+        if (newCap > SIZE_MAX / 2u) {
+            newCap = needed;
+            break;
+        }
+        newCap *= 2u;
+    }
+    uint8_t *grown = (uint8_t *)realloc(b->data, newCap);
+    if (!grown) return false;
+    b->data = grown;
+    b->cap = newCap;
+    return true;
+}
+
+static bool xscBufAppend(XSCByteBuf *b, const void *src, size_t n) {
+    if (n == 0u) return true;
+    if (!xscBufReserve(b, n)) return false;
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
+    return true;
+}
+
+static bool xscBufAppendByte(XSCByteBuf *b, uint8_t v) {
+    return xscBufAppend(b, &v, 1u);
+}
+
+static bool xscBufAppendU16(XSCByteBuf *b, uint16_t v) {
+    uint8_t out[2] = { (uint8_t)(v & 0xFFu), (uint8_t)((v >> 8) & 0xFFu) };
+    return xscBufAppend(b, out, sizeof(out));
+}
+
+static bool xscBufAppendU32(XSCByteBuf *b, uint32_t v) {
+    uint8_t out[4] = {
+        (uint8_t)(v & 0xFFu),
+        (uint8_t)((v >> 8) & 0xFFu),
+        (uint8_t)((v >> 16) & 0xFFu),
+        (uint8_t)((v >> 24) & 0xFFu),
+    };
+    return xscBufAppend(b, out, sizeof(out));
+}
+
+static bool xscBufAppendU64(XSCByteBuf *b, uint64_t v) {
+    return xscBufAppendU32(b, (uint32_t)(v & 0xFFFFFFFFu)) &&
+           xscBufAppendU32(b, (uint32_t)(v >> 32));
+}
+
+static XSCData *xscBufTakeData(XSCByteBuf *b) {
+    if (!b || b->len == 0u || !b->data) {
+        xscBufFree(b);
+        return [XSCData emptyData];
+    }
+    uint8_t *ptr = b->data;
+    size_t len = b->len;
+    b->data = NULL;
+    b->len = 0u;
+    b->cap = 0u;
+    return [XSCData dataTakingBytesNoCopy:ptr length:len];
+}
+
+static bool writeFileBytes(const char *path, const void *bytes, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    defer { fclose(f); }
+    if (len > 0u && fwrite(bytes, 1u, len, f) != len) {
+        return false;
+    }
+    return fflush(f) == 0;
+}
+
+static bool writeDataToFile(const char *path, XSCData *data) {
+    return writeFileBytes(path, data ? data.bytes : NULL, data ? data.length : 0u);
+}
+
+static bool makeDirs(const char *path) {
+    if (!path || path[0] == '\0') return false;
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(tmp)) return false;
+    memcpy(tmp, path, len + 1u);
+    for (size_t i = 1u; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
+            tmp[i] = '/';
+        }
+    }
+    return mkdir(tmp, 0755) == 0 || errno == EEXIST;
+}
+
+static void pumpMainUntil(bool (^predicate)(void), double timeoutMs) {
+    double deadline = nowMilliseconds() + timeoutMs;
+    while (!predicate() && nowMilliseconds() < deadline) {
+        xsc_main_wait_ms(10u);
+    }
+    xsc_main_drain();
+}
+
+#pragma mark - Synthetic Image Generators (libpng, libjpeg, raw GIF89a)
+
+static void pngMemWriteCallback(png_structp png, png_bytep data, png_size_t length) {
+    XSCByteBuf *buf = (XSCByteBuf *)png_get_io_ptr(png);
+    if (!buf || !xscBufAppend(buf, data, length)) {
+        png_error(png, "out of memory");
+    }
+}
+
+static void pngMemFlushCallback(png_structp png) {
+    (void)png;
+}
+
+static bool encodePngRows(png_structp png, png_infop info,
+                          size_t w, size_t h, png_bytep *rows) {
+    if (setjmp(png_jmpbuf(png)) != 0) {
+        return false;
+    }
+    png_set_IHDR(png, info, (png_uint_32)w, (png_uint_32)h, 8,
+                 PNG_COLOR_TYPE_RGBA, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+    png_write_image(png, rows);
+    png_write_end(png, NULL);
+    return true;
+}
+
+static XSCData *makeSyntheticPNG(size_t w, size_t h, bool grayscaleRGB) {
+    size_t bpr = w * 4u;
+    uint8_t *pixels = (uint8_t *)calloc(h, bpr);
+    if (!pixels) return [XSCData emptyData];
+    defer { free(pixels); }
+
+    for (size_t y = 0u; y < h; y++) {
+        for (size_t x = 0u; x < w; x++) {
+            uint8_t *px = pixels + y * bpr + x * 4u;
+            uint8_t v = (uint8_t)((x + y) & 0xFFu);
+            if (grayscaleRGB) {
+                px[0] = v; px[1] = v; px[2] = v; px[3] = 255u;
+            } else {
+                px[0] = (uint8_t)((x * 3u) & 0xFFu);
+                px[1] = (uint8_t)((y * 5u) & 0xFFu);
+                px[2] = (uint8_t)(((x ^ y) * 7u) & 0xFFu);
+                px[3] = 255u;
+            }
+        }
+    }
+
+    png_bytep *rows = (png_bytep *)malloc(h * sizeof(png_bytep));
+    if (!rows) return [XSCData emptyData];
+    defer { free(rows); }
+    for (size_t y = 0u; y < h; y++) {
+        rows[y] = pixels + y * bpr;
+    }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) return [XSCData emptyData];
+    png_infop info = png_create_info_struct(png);
+    defer { png_destroy_write_struct(&png, info ? &info : NULL); }
+    if (!info) return [XSCData emptyData];
+
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+    png_set_write_fn(png, &out, pngMemWriteCallback, pngMemFlushCallback);
+
+    if (!encodePngRows(png, info, w, h, rows)) {
+        return [XSCData emptyData];
+    }
+    return xscBufTakeData(&out);
+}
+
+typedef struct TestJpegErrMgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf env;
+} TestJpegErrMgr;
+
+static void testJpegErrorExit(j_common_ptr cinfo) {
+    TestJpegErrMgr *mgr = (TestJpegErrMgr *)cinfo->err;
+    longjmp(mgr->env, 1);
+}
+
+static bool encodeJpegScanlines(struct jpeg_compress_struct *cinfo,
+                                TestJpegErrMgr *jerr,
+                                size_t w, size_t h,
+                                uint8_t *rgb,
+                                uint16_t exifOrientation) {
+    if (setjmp(jerr->env) != 0) {
+        return false;
+    }
+    cinfo->image_width = (JDIMENSION)w;
+    cinfo->image_height = (JDIMENSION)h;
+    cinfo->input_components = 3;
+    cinfo->in_color_space = JCS_RGB;
+    jpeg_set_defaults(cinfo);
+    jpeg_set_quality(cinfo, 85, TRUE);
+    if (exifOrientation >= 1u && exifOrientation <= 8u) {
+        cinfo->write_JFIF_header = FALSE;
+    }
+    jpeg_start_compress(cinfo, TRUE);
+
+    if (exifOrientation >= 1u && exifOrientation <= 8u) {
+        // Minimal valid little-endian ("II") EXIF APP1 block with Orientation tag 0x0112.
+        const uint8_t exifApp1[32] = {
+            'E', 'x', 'i', 'f', 0x00, 0x00,
+            'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
+            0x01, 0x00,
+            0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00,
+            (uint8_t)(exifOrientation & 0xFFu),
+            (uint8_t)((exifOrientation >> 8) & 0xFFu),
+            0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        };
+        jpeg_write_marker(cinfo, JPEG_APP0 + 1, exifApp1, (unsigned int)sizeof(exifApp1));
+    }
+
+    size_t rowStride = w * 3u;
+    while (cinfo->next_scanline < cinfo->image_height) {
+        JSAMPROW row = rgb + (size_t)cinfo->next_scanline * rowStride;
+        jpeg_write_scanlines(cinfo, &row, 1);
+    }
+    jpeg_finish_compress(cinfo);
+    return true;
+}
+
+static XSCData *makeSyntheticJPEG(size_t w, size_t h, bool grayscaleRGB, uint16_t exifOrientation) {
+    size_t rowStride = w * 3u;
+    uint8_t *rgb = (uint8_t *)calloc(h, rowStride);
+    if (!rgb) return [XSCData emptyData];
+    defer { free(rgb); }
+
+    for (size_t y = 0u; y < h; y++) {
+        for (size_t x = 0u; x < w; x++) {
+            uint8_t *px = rgb + y * rowStride + x * 3u;
+            uint8_t v = (uint8_t)((x + y) & 0xFFu);
+            if (grayscaleRGB) {
+                px[0] = v; px[1] = v; px[2] = v;
+            } else {
+                px[0] = (uint8_t)((x * 3u) & 0xFFu);
+                px[1] = (uint8_t)((y * 5u) & 0xFFu);
+                px[2] = (uint8_t)(((x ^ y) * 7u) & 0xFFu);
+            }
+        }
+    }
+
+    struct jpeg_compress_struct cinfo;
+    TestJpegErrMgr jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = testJpegErrorExit;
+    jpeg_create_compress(&cinfo);
+    defer { jpeg_destroy_compress(&cinfo); }
+
+    unsigned char *outBuf = NULL;
+    unsigned long outSize = 0UL;
+    jpeg_mem_dest(&cinfo, &outBuf, &outSize);
+    defer { free(outBuf); }
+
+    if (!encodeJpegScanlines(&cinfo, &jerr, w, h, rgb, exifOrientation) || !outBuf || outSize == 0UL) {
+        return [XSCData emptyData];
+    }
+    return [XSCData dataWithBytes:outBuf length:(size_t)outSize];
+}
+
+// Raw GIF89a 2-frame encoder (2-color GCT, NETSCAPE2.0 loop, 100 ms frame delay).
+// Uses fixed 3-bit LZW codes (minCodeSize=2) with Clear(4) emitted before each pair
+// of pixels so the LZW table never grows past code 7.
+typedef struct GifBitWriter {
+    XSCByteBuf rawBytes;
+    uint32_t bitAccum;
+    int bitCount;
+} GifBitWriter;
+
+static void gifWriteBits(GifBitWriter *gw, uint32_t code, int bits) {
+    gw->bitAccum |= (code << gw->bitCount);
+    gw->bitCount += bits;
+    while (gw->bitCount >= 8) {
+        xscBufAppendByte(&gw->rawBytes, (uint8_t)(gw->bitAccum & 0xFFu));
+        gw->bitAccum >>= 8;
+        gw->bitCount -= 8;
+    }
+}
+
+static void gifFlushBits(GifBitWriter *gw) {
+    if (gw->bitCount > 0) {
+        xscBufAppendByte(&gw->rawBytes, (uint8_t)(gw->bitAccum & 0xFFu));
+        gw->bitAccum = 0u;
+        gw->bitCount = 0;
+    }
+}
+
+static XSCData *makeAnimatedGIFData(size_t w, size_t h) {
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+
+    // Header + Logical Screen Descriptor (2-entry Global Color Table)
+    xscBufAppend(&out, "GIF89a", 6u);
+    xscBufAppendU16(&out, (uint16_t)w);
+    xscBufAppendU16(&out, (uint16_t)h);
+    xscBufAppendByte(&out, 0x80u); // GCT present, 2 colors (2^(0+1))
+    xscBufAppendByte(&out, 0x00u); // Background color index
+    xscBufAppendByte(&out, 0x00u); // Pixel aspect ratio
+
+    // Global Color Table: index 0 = (200, 40, 100), index 1 = (40, 200, 100)
+    const uint8_t gct[6] = { 200u, 40u, 100u, 40u, 200u, 100u };
+    xscBufAppend(&out, gct, sizeof(gct));
+
+    // NETSCAPE2.0 looping application extension (infinite loop)
+    const uint8_t netscapeExt[19] = {
+        0x21, 0xFF, 0x0B,
+        'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0',
+        0x03, 0x01, 0x00, 0x00,
+        0x00
+    };
+    xscBufAppend(&out, netscapeExt, sizeof(netscapeExt));
+
+    const size_t totalPixels = w * h;
+    for (uint32_t frame = 0u; frame < 2u; frame++) {
+        // Graphic Control Extension: disposal=1 (do not dispose), delay=10 (100 ms)
+        const uint8_t gce[8] = { 0x21, 0xF9, 0x04, 0x04, 0x0A, 0x00, 0x00, 0x00 };
+        xscBufAppend(&out, gce, sizeof(gce));
+
+        // Image Descriptor
+        xscBufAppendByte(&out, 0x2Cu);
+        xscBufAppendU16(&out, 0u);
+        xscBufAppendU16(&out, 0u);
+        xscBufAppendU16(&out, (uint16_t)w);
+        xscBufAppendU16(&out, (uint16_t)h);
+        xscBufAppendByte(&out, 0x00u);
+
+        // LZW Minimum Code Size = 2 (Clear=4, EOI=5, 3-bit codes)
+        xscBufAppendByte(&out, 2u);
+
+        GifBitWriter gw = {0};
+        defer { xscBufFree(&gw.rawBytes); }
+        for (size_t i = 0u; i < totalPixels; i += 2u) {
+            gifWriteBits(&gw, 4u, 3); // Clear
+            gifWriteBits(&gw, frame, 3);
+            if (i + 1u < totalPixels) {
+                gifWriteBits(&gw, frame, 3);
+            }
+        }
+        gifWriteBits(&gw, 5u, 3); // EOI
+        gifFlushBits(&gw);
+
+        // Emit LZW data in <= 255-byte sub-blocks
+        size_t off = 0u;
+        while (off < gw.rawBytes.len) {
+            size_t chunk = gw.rawBytes.len - off;
+            if (chunk > 255u) chunk = 255u;
+            xscBufAppendByte(&out, (uint8_t)chunk);
+            xscBufAppend(&out, gw.rawBytes.data + off, chunk);
+            off += chunk;
+        }
+        xscBufAppendByte(&out, 0x00u); // Sub-block terminator
+    }
+
+    xscBufAppendByte(&out, 0x3Bu); // GIF Trailer
+    return xscBufTakeData(&out);
+}
+
+#pragma mark - Synthetic Archive Generators (ZIP/Zip64 via zlib, TAR/7z via libarchive)
+
+typedef struct TestZipEntry {
+    const char *name;
+    __unsafe_unretained XSCData *payload;
+    bool deflate;
+    bool isSymlink;
+    uint64_t overrideUncompressedSize; // 0 => use payload.length
+} TestZipEntry;
+
+static XSCData *rawDeflateData(const uint8_t *src, size_t srcLen) {
+    if (!src && srcLen != 0u) return nil;
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        return nil;
+    }
+    defer { deflateEnd(&zs); }
+
+    uLong bound = deflateBound(&zs, (uLong)srcLen) + 64UL;
+    uint8_t *dst = (uint8_t *)malloc((size_t)bound);
+    if (!dst) return nil;
+
+    zs.next_in = (Bytef *)src;
+    zs.avail_in = (uInt)srcLen;
+    zs.next_out = dst;
+    zs.avail_out = (uInt)bound;
+
+    int rc = deflate(&zs, Z_FINISH);
+    if (rc != Z_STREAM_END) {
+        free(dst);
+        return nil;
+    }
+    return [XSCData dataTakingBytesNoCopy:dst length:(size_t)zs.total_out];
+}
+
+static bool writeTestZIP(const char *path, const TestZipEntry *entries, size_t count, bool forceZip64) {
+    XSCByteBuf archive = {0};
+    XSCByteBuf central = {0};
+    defer { xscBufFree(&archive); }
+    defer { xscBufFree(&central); }
+
+    for (size_t i = 0u; i < count; i++) {
+        const TestZipEntry *e = &entries[i];
+        XSCData *raw = e->payload ? e->payload : [XSCData emptyData];
+        XSCData *comp = raw;
+        uint16_t method = 0u;
+        if (e->deflate) {
+            XSCData *deflated = rawDeflateData(raw.bytes, raw.length);
+            if (deflated && deflated.length > 0u) {
+                comp = deflated;
+                method = 8u;
+            }
+        }
+        uLong crcVal = crc32(0L, Z_NULL, 0);
+        if (raw.length > 0u) {
+            crcVal = crc32(crcVal, raw.bytes, (uInt)raw.length);
+        }
+        uint32_t crc = (uint32_t)crcVal;
+        uint64_t uncompSize = e->overrideUncompressedSize ? e->overrideUncompressedSize : (uint64_t)raw.length;
+        uint64_t compSize = (uint64_t)comp.length;
+        uint64_t lfhOffset = (uint64_t)archive.len;
+        size_t nameLen = strlen(e->name);
+
+        bool useZ64Entry = forceZip64 || uncompSize >= 0xFFFFFFFFULL || compSize >= 0xFFFFFFFFULL;
+        XSCByteBuf extraLFH = {0};
+        XSCByteBuf extraCD = {0};
+        defer { xscBufFree(&extraLFH); }
+        defer { xscBufFree(&extraCD); }
+
+        if (useZ64Entry) {
+            xscBufAppendU16(&extraLFH, 0x0001u);
+            xscBufAppendU16(&extraLFH, 16u);
+            xscBufAppendU64(&extraLFH, uncompSize);
+            xscBufAppendU64(&extraLFH, compSize);
+
+            xscBufAppendU16(&extraCD, 0x0001u);
+            xscBufAppendU16(&extraCD, 24u);
+            xscBufAppendU64(&extraCD, uncompSize);
+            xscBufAppendU64(&extraCD, compSize);
+            xscBufAppendU64(&extraCD, lfhOffset);
+        }
+
+        // Local file header
+        xscBufAppendU32(&archive, 0x04034b50u);
+        xscBufAppendU16(&archive, useZ64Entry ? 45u : 20u);
+        xscBufAppendU16(&archive, 0u);
+        xscBufAppendU16(&archive, method);
+        xscBufAppendU16(&archive, 0u);
+        xscBufAppendU16(&archive, 0u);
+        xscBufAppendU32(&archive, crc);
+        xscBufAppendU32(&archive, useZ64Entry ? 0xFFFFFFFFu : (uint32_t)compSize);
+        xscBufAppendU32(&archive, useZ64Entry ? 0xFFFFFFFFu : (uint32_t)uncompSize);
+        xscBufAppendU16(&archive, (uint16_t)nameLen);
+        xscBufAppendU16(&archive, (uint16_t)extraLFH.len);
+        xscBufAppend(&archive, e->name, nameLen);
+        xscBufAppend(&archive, extraLFH.data, extraLFH.len);
+        xscBufAppend(&archive, comp.bytes, comp.length);
+
+        // Central directory header
+        xscBufAppendU32(&central, 0x02014b50u);
+        xscBufAppendU16(&central, (uint16_t)((3u << 8) | (useZ64Entry ? 45u : 20u))); // Unix creator
+        xscBufAppendU16(&central, useZ64Entry ? 45u : 20u);
+        xscBufAppendU16(&central, 0u);
+        xscBufAppendU16(&central, method);
+        xscBufAppendU16(&central, 0u);
+        xscBufAppendU16(&central, 0u);
+        xscBufAppendU32(&central, crc);
+        xscBufAppendU32(&central, useZ64Entry ? 0xFFFFFFFFu : (uint32_t)compSize);
+        xscBufAppendU32(&central, useZ64Entry ? 0xFFFFFFFFu : (uint32_t)uncompSize);
+        xscBufAppendU16(&central, (uint16_t)nameLen);
+        xscBufAppendU16(&central, (uint16_t)extraCD.len);
+        xscBufAppendU16(&central, 0u);
+        xscBufAppendU16(&central, 0u);
+        xscBufAppendU16(&central, 0u);
+        uint32_t extAttr = e->isSymlink ? (0120777u << 16) : (0100644u << 16);
+        xscBufAppendU32(&central, extAttr);
+        xscBufAppendU32(&central, useZ64Entry ? 0xFFFFFFFFu : (uint32_t)lfhOffset);
+        xscBufAppend(&central, e->name, nameLen);
+        xscBufAppend(&central, extraCD.data, extraCD.len);
+    }
+
+    uint64_t cdOffset = (uint64_t)archive.len;
+    uint64_t cdSize = (uint64_t)central.len;
+    xscBufAppend(&archive, central.data, central.len);
+
+    if (forceZip64) {
+        uint64_t z64EocdOffset = (uint64_t)archive.len;
+        // Zip64 EOCD
+        xscBufAppendU32(&archive, 0x06064b50u);
+        xscBufAppendU64(&archive, 44ULL);
+        xscBufAppendU16(&archive, 45u);
+        xscBufAppendU16(&archive, 45u);
+        xscBufAppendU32(&archive, 0u);
+        xscBufAppendU32(&archive, 0u);
+        xscBufAppendU64(&archive, (uint64_t)count);
+        xscBufAppendU64(&archive, (uint64_t)count);
+        xscBufAppendU64(&archive, cdSize);
+        xscBufAppendU64(&archive, cdOffset);
+        // Zip64 EOCD Locator
+        xscBufAppendU32(&archive, 0x07064b50u);
+        xscBufAppendU32(&archive, 0u);
+        xscBufAppendU64(&archive, z64EocdOffset);
+        xscBufAppendU32(&archive, 1u);
+    }
+
+    // Classic EOCD
+    xscBufAppendU32(&archive, 0x06054b50u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, forceZip64 ? 0xFFFFu : (uint16_t)count);
+    xscBufAppendU16(&archive, forceZip64 ? 0xFFFFu : (uint16_t)count);
+    xscBufAppendU32(&archive, forceZip64 ? 0xFFFFFFFFu : (uint32_t)cdSize);
+    xscBufAppendU32(&archive, forceZip64 ? 0xFFFFFFFFu : (uint32_t)cdOffset);
+    xscBufAppendU16(&archive, 0u);
+
+    return writeFileBytes(path, archive.data, archive.len);
+}
+
+typedef enum TestArchiveFormat {
+    TestArchiveFormatUstar = 0,
+    TestArchiveFormatPax = 1,
+    TestArchiveFormatGnuTar = 2,
+    TestArchiveFormat7zip = 3,
+} TestArchiveFormat;
+
+typedef struct TestArchiveEntry {
+    const char *name;
+    __unsafe_unretained XSCData *payload;
+} TestArchiveEntry;
+
+static bool writeTestLibarchive(const char *path,
+                                TestArchiveFormat fmt,
+                                const TestArchiveEntry *entries,
+                                size_t count) {
+    struct archive *a = archive_write_new();
+    if (!a) return false;
+    defer { archive_write_free(a); }
+
+    int rc = ARCHIVE_FATAL;
+    switch (fmt) {
+        case TestArchiveFormatUstar:
+            rc = archive_write_set_format_ustar(a);
+            break;
+        case TestArchiveFormatPax:
+            rc = archive_write_set_format_pax(a);
+            break;
+        case TestArchiveFormatGnuTar:
+            rc = archive_write_set_format_gnutar(a);
+            break;
+        case TestArchiveFormat7zip:
+            rc = archive_write_set_format_7zip(a);
+            break;
+    }
+    if (rc != ARCHIVE_OK) return false;
+    if (archive_write_open_filename(a, path) != ARCHIVE_OK) return false;
+
+    for (size_t i = 0u; i < count; i++) {
+        XSCData *raw = entries[i].payload ? entries[i].payload : [XSCData emptyData];
+        struct archive_entry *entry = archive_entry_new();
+        if (!entry) return false;
+        defer { archive_entry_free(entry); }
+
+        archive_entry_set_pathname(entry, entries[i].name);
+        archive_entry_set_size(entry, (la_int64_t)raw.length);
+        archive_entry_set_filetype(entry, AE_IFREG);
+        archive_entry_set_perm(entry, 0644);
+        archive_entry_set_mtime(entry, 1700000000, 0);
+
+        if (archive_write_header(a, entry) != ARCHIVE_OK) return false;
+        if (raw.length > 0u) {
+            la_ssize_t written = archive_write_data(a, raw.bytes, raw.length);
+            if (written < 0 || (size_t)written != raw.length) return false;
+        }
+    }
+    return archive_write_close(a) == ARCHIVE_OK;
+}
+
+#pragma mark - Objective-C 3.0 Helpers & Reader Delegate
+
+@interface TestLifetimeProbe : XSCObject
+@property (nonatomic) int *deallocCounter;
+@end
+
+@implementation TestLifetimeProbe
+- (void)dealloc {
+    if (_deallocCounter) {
+        (*_deallocCounter)++;
+    }
+}
+@end
+
+@interface TestReaderDelegate : XSCObject <XSCReaderModelDelegate>
+@property (nonatomic) size_t stateUpdates;
+@property (nonatomic) size_t displayUpdates;
+@property (nonatomic, strong) XSCDecodedPage *lastLeft;
+@property (nonatomic, strong) XSCDecodedPage *lastRight;
+@property (nonatomic) bool lastShowEmpty;
+@property (nonatomic) bool lastLoading;
+@property (nonatomic, strong) XSCString *lastStatus;
+@end
+
+@implementation TestReaderDelegate
+
+- (void)readerModelDidUpdateState:(XSCReaderModel *)model {
+    (void)model;
+    self.stateUpdates++;
+}
+
+- (void)readerModel:(XSCReaderModel *)model
+    displayLeftPage:(XSCOptDecodedPage)leftPage
+          rightPage:(XSCOptDecodedPage)rightPage
+       showEmptyCTA:(bool)showEmptyCTA
+          isLoading:(bool)isLoading
+         statusText:(XSCOptString)statusText {
+    (void)model;
+    self.displayUpdates++;
+    self.lastLeft = match(leftPage) {
+        case .Some(let p) => p;
+        case .None => (XSCDecodedPage *)nil;
+    };
+    self.lastRight = match(rightPage) {
+        case .Some(let p) => p;
+        case .None => (XSCDecodedPage *)nil;
+    };
+    self.lastShowEmpty = showEmptyCTA;
+    self.lastLoading = isLoading;
+    self.lastStatus = match(statusText) {
+        case .Some(let s) => s;
+        case .None => (XSCString *)nil;
+    };
+}
+
+@end
+
+static int testThrowingHelper(bool shouldFail) throws(XSCError *) {
+    if (shouldFail) {
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainArchive
+                                             code:XSCArchiveErrorCorruptArchive
+                                          message:"synthetic throw"];
+        throwError(err);
+    }
+    return 1234;
+}
+
+static void recordEarlyReturnDefer(int *outFlag) {
+    defer { *outFlag = 99; }
+    return;
+}
+
+#pragma mark - Test 1: Objective-C 3.0 Language & Runtime Semantics
+
+static void testObjectiveC3Semantics(void) {
+    printf("[TEST] Objective-C 3.0 Language & Runtime Semantics\n");
+
+    // Compiler feature contract checks
+#if defined(__APPLE__)
+    XSC_ASSERT(__OBJC3__ == 1, "Objective-C 3 compilation is active");
+#else
+    XSC_ASSERT(objc3_has_feature(OBJC3_FEATURE_DEFER) != 0, "objc3 defer feature enabled");
+    XSC_ASSERT(objc3_has_feature(OBJC3_FEATURE_OPTIONALS) != 0, "objc3 optionals feature enabled");
+    XSC_ASSERT(objc3_has_feature(OBJC3_FEATURE_RESULT) != 0, "objc3 result feature enabled");
+    XSC_ASSERT(objc3_has_feature(OBJC3_FEATURE_THROWS) != 0, "objc3 throws feature enabled");
+#endif
+
+    // 1. defer LIFO ordering + early return execution
+    int order[3] = { 0, 0, 0 };
+    int idx = 0;
+    {
+        defer { order[idx++] = 1; }
+        defer { order[idx++] = 2; }
+        defer { order[idx++] = 3; }
+    }
+    XSC_ASSERT(idx == 3 && order[0] == 3 && order[1] == 2 && order[2] == 1,
+               "defer executes in strict LIFO order (%d,%d,%d)", order[0], order[1], order[2]);
+
+    int earlyFlag = 0;
+    recordEarlyReturnDefer(&earlyFlag);
+    XSC_ASSERT(earlyFlag == 99, "defer executes on early return");
+
+    // 2. Optional + exhaustive match value results
+    XSCOptString someStr = Some(XSCString *, [XSCString stringWithUTF8:"manga"]);
+    XSCOptString noneStr = None(XSCString *);
+    bool someMatched = match(someStr) {
+        case .Some(let s) => [s isEqualToUTF8:"manga"];
+        case .None => false;
+    };
+    size_t noneLen = match(noneStr) {
+        case .Some(let s) => [s length];
+        case .None => (size_t)777u;
+    };
+    XSC_ASSERT(someMatched, "Optional.Some exhaustive match yields expected payload");
+    XSC_ASSERT(noneLen == 777u, "Optional.None exhaustive match yields fallback");
+
+    // 3. Result(T, E) + exhaustive match value results
+    typedef Result(int, XSCError *) TestIntResult;
+    TestIntResult okRes = Ok(int, XSCError *, 42);
+    TestIntResult errRes = Err(int, XSCError *,
+                               [XSCError errorWithDomain:XSCErrorDomainImage code:19 message:"decode failed"]);
+    int okOut = match(okRes) {
+        case .Ok(let v) => v;
+        case .Err(let e) => -e.code;
+    };
+    int errOut = match(errRes) {
+        case .Ok(let v) => v;
+        case .Err(let e) => -e.code;
+    };
+    XSC_ASSERT(okOut == 42, "Result.Ok exhaustive match returns 42");
+    XSC_ASSERT(errOut == -19, "Result.Err exhaustive match carries XSCError code");
+
+    // 4. Typed throws(XSCError *) / tryValue / tryOptional / handle-catch
+    int okVal = 0;
+    int caughtCode = 0;
+    XSCString *caughtMsg = nil;
+    handle {
+        okVal = tryValue(testThrowingHelper(false));
+    } catch(XSCError *e) {
+        caughtCode = e.code;
+    }
+    XSC_ASSERT(okVal == 1234 && caughtCode == 0, "tryValue succeeds without entering catch");
+
+    handle {
+        (void)tryValue(testThrowingHelper(true));
+    } catch(XSCError *e) {
+        caughtCode = e.code;
+        caughtMsg = e.message;
+    }
+    XSC_ASSERT(caughtCode == XSCArchiveErrorCorruptArchive && [caughtMsg isEqualToUTF8:"synthetic throw"],
+               "handle/catch captures exact typed XSCError");
+
+    Optional(int) optSuccess = tryOptional(testThrowingHelper(false));
+    Optional(int) optFailure = tryOptional(testThrowingHelper(true));
+    int optVal1 = match(optSuccess) {
+        case .Some(let v) => v;
+        case .None => -1;
+    };
+    int optVal2 = match(optFailure) {
+        case .Some(let v) => v;
+        case .None => -1;
+    };
+    XSC_ASSERT(optVal1 == 1234 && optVal2 == -1, "tryOptional bridges throws to Optional");
+
+    // 5. ARC subclass dealloc + __weak zeroing (without [super dealloc])
+    int deallocCount = 0;
+    __weak TestLifetimeProbe *weakProbe = nil;
+    bool weakAliveInside = false;
+    @autoreleasepool {
+        TestLifetimeProbe *strongProbe = [[TestLifetimeProbe alloc] init];
+        strongProbe.deallocCounter = &deallocCount;
+        weakProbe = strongProbe;
+        weakAliveInside = (weakProbe != nil);
+        strongProbe = nil;
+    }
+    XSC_ASSERT(weakAliveInside, "__weak holds live reference while strong owner exists");
+    XSC_ASSERT(deallocCount == 1 && weakProbe == nil,
+               "ARC dealloc fires once (%d) and zeroes __weak reference", deallocCount);
+}
+
+#pragma mark - Test 2: Extensions & Natural Sort
+
+static void testExtensionsAndNaturalSort(void) {
+    printf("[TEST] Extensions & Natural Sort\n");
+    XSC_ASSERT([XSCBook isSupportedArchiveExtension:"cbz"], "cbz supported");
+    XSC_ASSERT([XSCBook isSupportedArchiveExtension:"CB7"], "CB7 case-insensitive");
+    XSC_ASSERT([XSCBook isSupportedArchiveExtension:"cbt"], "cbt supported");
+    XSC_ASSERT([XSCBook isSupportedArchiveExtension:"cbr"], "cbr supported");
+    XSC_ASSERT(![XSCBook isSupportedArchiveExtension:"pdf"], "pdf not archive");
+    XSC_ASSERT([XSCBook isSupportedImageExtension:"png"], "png supported");
+    XSC_ASSERT([XSCBook isSupportedImageExtension:"WEBP"], "WEBP supported");
+    XSC_ASSERT([XSCBook isSupportedImageExtension:"gif"], "gif supported");
+    XSC_ASSERT(![XSCBook isSupportedImageExtension:"txt"], "txt not image");
+
+    const char *a = "page2.png", *b = "page10.png";
+    XSC_ASSERT([XSCBook naturalCompareBytes:a length:strlen(a) withBytes:b length:strlen(b)] == XSCOrderedAscending,
+               "page2 < page10");
+    XSC_ASSERT([XSCBook naturalCompareBytes:b length:strlen(b) withBytes:a length:strlen(a)] == XSCOrderedDescending,
+               "page10 > page2");
+    XSC_ASSERT([XSCBook naturalCompareBytes:a length:strlen(a) withBytes:a length:strlen(a)] == XSCOrderedSame,
+               "page2 == page2");
+
+    // UTF-8 Japanese chapter numbering: "第2話.png" < "第10話.png"
+    const char *u1 = "\xe7\xac\xac""2\xe8\xa9\xb1.png";
+    const char *u2 = "\xe7\xac\xac""10\xe8\xa9\xb1.png";
+    XSC_ASSERT([XSCBook naturalCompareBytes:u1 length:strlen(u1) withBytes:u2 length:strlen(u2)] == XSCOrderedAscending,
+               "UTF-8 natural sort works");
+}
+
+#pragma mark - Test 3: CBZ STORE, DEFLATE, Zip64, Path Traversal, Symlink, Zip Bomb
+
+static void testCBZStoreDeflateZip64Security(XSCString *tmpDir, XSCData *png1, XSCData *png2) {
+    printf("[TEST] CBZ STORE, DEFLATE, Zip64, Security\n");
+
+    // 1. STORE + DEFLATE + natural ordering + __MACOSX & non-image filtering
+    XSCString *cbzPath = [tmpDir stringByAppendingPathComponent:"mixed.cbz"];
+    XSCData *helloData = [XSCData dataWithBytes:"hello" length:5u];
+    TestZipEntry entries[] = {
+        { "ch1/page10.png", png2, true, false, 0ULL },
+        { "ch1/page2.png", png1, false, false, 0ULL },
+        { "__MACOSX/._page2.png", png1, false, false, 0ULL },
+        { "notes.txt", helloData, false, false, 0ULL },
+    };
+    XSC_ASSERT(writeTestZIP(cbzPath.utf8, entries, 4u, false), "write mixed.cbz");
+
+    XSCBook *book = nil;
+    XSCError *openErr = nil;
+    handle {
+        book = tryValue([XSCBook openPath:cbzPath.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        openErr = e;
+    }
+    XSC_ASSERT(book != nil && openErr == nil, "open mixed.cbz failed: %s",
+               openErr ? openErr.message.utf8 : "");
+    XSC_ASSERT(book && book.pageCount == 2u, "expected 2 pages, got %zu",
+               book ? book.pageCount : 0u);
+    if (book && book.pageCount == 2u) {
+        XSC_ASSERT([[book pageNameAtIndex:0u] hasSuffixUTF8:"page2.png"], "natural sort page 0");
+        XSC_ASSERT([[book pageNameAtIndex:1u] hasSuffixUTF8:"page10.png"], "natural sort page 1");
+        XSCOptData d0 = tryOptional([book readPageDataAtIndex:0u]);
+        XSCOptData d1 = tryOptional([book readPageDataAtIndex:1u]);
+        bool match0 = match(d0) {
+            case .Some(let data) => [data isEqualToData:png1];
+            case .None => false;
+        };
+        bool match1 = match(d1) {
+            case .Some(let data) => [data isEqualToData:png2];
+            case .None => false;
+        };
+        XSC_ASSERT(match0, "STORE payload matches byte-for-byte");
+        XSC_ASSERT(match1, "DEFLATE payload matches byte-for-byte");
+    }
+
+    XSCString *emptyPath = [tmpDir stringByAppendingPathComponent:"empty-page.cbz"];
+    TestZipEntry emptyEntries[] = {
+        { "01.png", nil, true, false, 0ULL },
+    };
+    XSC_ASSERT(writeTestZIP(emptyPath.utf8, emptyEntries, 1u, false), "write empty DEFLATE page");
+    XSCBook *emptyBook = nil;
+    XSCData *emptyPage = nil;
+    handle {
+        emptyBook = tryValue([XSCBook openPath:emptyPath.utf8 cancelFlag:NULL]);
+        emptyPage = tryValue([emptyBook readPageDataAtIndex:0u]);
+    } catch (XSCError *e) { (void)e; }
+    XSC_ASSERT(emptyPage != nil && emptyPage.length == 0u, "verify a valid empty DEFLATE stream");
+
+    // Simulate a damaged page on disk after a valid index has been opened.
+    XSCString *damagedPath = [tmpDir stringByAppendingPathComponent:"checksum.cbz"];
+    const char *storedName = "01.png";
+    TestZipEntry damagedEntries[] = { { storedName, png1, false, false, 0ULL } };
+    XSC_ASSERT(writeTestZIP(damagedPath.utf8, damagedEntries, 1u, false), "write checksummed STORE page");
+    XSCBook *damagedBook = nil;
+    handle {
+        damagedBook = tryValue([XSCBook openPath:damagedPath.utf8 cancelFlag:NULL]);
+    } catch (XSCError *e) { (void)e; }
+    int damageFd = open(damagedPath.utf8, O_WRONLY | O_CLOEXEC);
+    off_t pageOffset = (off_t)(30u + strlen(storedName));
+    uint8_t changed = png1.bytes[0] ^ 1u;
+    bool damaged = damageFd >= 0 && pwrite(damageFd, &changed, sizeof(changed), pageOffset) == 1;
+    if (damageFd >= 0) close(damageFd);
+    bool rejected = false;
+    if (damagedBook && damaged) {
+        handle {
+            (void)tryValue([damagedBook readPageDataAtIndex:0u]);
+        } catch (XSCError *e) {
+            rejected = e.code == XSCArchiveErrorCorruptArchive;
+        }
+    }
+    XSC_ASSERT(rejected, "revalidate STORE checksum on page read");
+
+    // 2. Zip64
+    XSCString *z64Path = [tmpDir stringByAppendingPathComponent:"zip64.cbz"];
+    TestZipEntry z64Entries[] = {
+        { "001.png", png1, true, false, 0ULL },
+        { "002.png", png2, false, false, 0ULL },
+    };
+    XSC_ASSERT(writeTestZIP(z64Path.utf8, z64Entries, 2u, true), "write zip64.cbz");
+    XSCBook *z64Book = nil;
+    openErr = nil;
+    handle {
+        z64Book = tryValue([XSCBook openPath:z64Path.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        openErr = e;
+    }
+    XSC_ASSERT(z64Book != nil && z64Book.pageCount == 2u, "open zip64.cbz failed: %s",
+               openErr ? openErr.message.utf8 : "");
+    if (z64Book && z64Book.pageCount == 2u) {
+        XSCOptData z0 = tryOptional([z64Book readPageDataAtIndex:0u]);
+        bool zMatch = match(z0) {
+            case .Some(let data) => [data isEqualToData:png1];
+            case .None => false;
+        };
+        XSC_ASSERT(zMatch, "Zip64 DEFLATE read matches");
+    }
+
+    // 3. Path traversal rejected
+    XSCString *travPath = [tmpDir stringByAppendingPathComponent:"traversal.cbz"];
+    TestZipEntry travEntries[] = { { "../evil.png", png1, false, false, 0ULL } };
+    writeTestZIP(travPath.utf8, travEntries, 1u, false);
+    XSCOptBook travBook = tryOptional([XSCBook openPath:travPath.utf8 cancelFlag:NULL]);
+    bool travRejected = match(travBook) {
+        case .Some(let b) => (b == nil);
+        case .None => true;
+    };
+    XSC_ASSERT(travRejected, "path traversal archive must be rejected");
+
+    // 4. Symlink entry skipped / rejected
+    XSCString *symPath = [tmpDir stringByAppendingPathComponent:"symlink.cbz"];
+    XSCData *passwdTarget = [XSCData dataWithBytes:"/etc/passwd" length:11u];
+    TestZipEntry symEntries[] = {
+        { "link.png", passwdTarget, false, true, 0ULL }
+    };
+    writeTestZIP(symPath.utf8, symEntries, 1u, false);
+    XSCOptBook symBook = tryOptional([XSCBook openPath:symPath.utf8 cancelFlag:NULL]);
+    bool symRejected = match(symBook) {
+        case .Some(let b) => (b == nil);
+        case .None => true;
+    };
+    XSC_ASSERT(symRejected, "symlink-only archive must have 0 valid images");
+
+    // 5. Zip bomb (2 GiB declared uncompressed size)
+    XSCString *bombPath = [tmpDir stringByAppendingPathComponent:"bomb.cbz"];
+    TestZipEntry bombEntries[] = {
+        { "bomb.png", png1, true, false, 2ULL * 1024ULL * 1024ULL * 1024ULL }
+    };
+    writeTestZIP(bombPath.utf8, bombEntries, 1u, true);
+    XSCOptBook bombBookOpt = tryOptional([XSCBook openPath:bombPath.utf8 cancelFlag:NULL]);
+    match(bombBookOpt) {
+        case .Some(let bombBook): {
+            if (bombBook && bombBook.pageCount > 0u) {
+                XSCOptData bombData = tryOptional([bombBook readPageDataAtIndex:0u]);
+                bool readRejected = match(bombData) {
+                    case .Some(let d) => (d == nil);
+                    case .None => true;
+                };
+                XSC_ASSERT(readRejected, "zip bomb read must be rejected");
+            } else {
+                XSC_ASSERT(false, "unexpected empty bomb book");
+            }
+        }
+        case .None: {
+            XSC_ASSERT(true, "zip bomb rejected at open");
+        }
+    }
+}
+
+#pragma mark - Test 4: CBT (tar ustar + PAX + GNU LongName) & CB7 (libarchive 7z)
+
+static void testCBTAndCB7(XSCString *tmpDir, XSCData *png1, XSCData *png2) {
+    printf("[TEST] CBT (tar ustar/PAX/GNU LongName) & CB7 (libarchive 7z)\n");
+
+    // 1. Standard ustar CBT
+    XSCString *cbtPath = [tmpDir stringByAppendingPathComponent:"sample.cbt"];
+    TestArchiveEntry tarEntries[] = {
+        { "page10.png", png2 },
+        { "page2.png", png1 },
+    };
+    XSC_ASSERT(writeTestLibarchive(cbtPath.utf8, TestArchiveFormatUstar, tarEntries, 2u),
+               "create sample.cbt (ustar)");
+    XSCBook *cbt = nil;
+    XSCError *err = nil;
+    handle {
+        cbt = tryValue([XSCBook openPath:cbtPath.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(cbt != nil && cbt.pageCount == 2u, "open sample.cbt failed: %s",
+               err ? err.message.utf8 : "");
+    if (cbt && cbt.pageCount == 2u) {
+        XSCOptData d0 = tryOptional([cbt readPageDataAtIndex:0u]);
+        XSCOptData d1 = tryOptional([cbt readPageDataAtIndex:1u]);
+        bool m0 = match(d0) { case .Some(let d) => [d isEqualToData:png1]; case .None => false; };
+        bool m1 = match(d1) { case .Some(let d) => [d isEqualToData:png2]; case .None => false; };
+        XSC_ASSERT(m0, "CBT ustar page 0 matches");
+        XSC_ASSERT(m1, "CBT ustar page 1 matches");
+    }
+
+    // 2. PAX extended-header CBT (>100-byte pathname)
+    const char *longName10 =
+        "volume_01_very_long_directory_prefix_for_tar_extended_header_validation_0123456789/"
+        "nested_chapter_subfolder_extra/page10.png";
+    const char *longName2 =
+        "volume_01_very_long_directory_prefix_for_tar_extended_header_validation_0123456789/"
+        "nested_chapter_subfolder_extra/page2.png";
+    TestArchiveEntry longEntries[] = {
+        { longName10, png2 },
+        { longName2, png1 },
+    };
+
+    XSCString *paxPath = [tmpDir stringByAppendingPathComponent:"pax_long.cbt"];
+    XSC_ASSERT(writeTestLibarchive(paxPath.utf8, TestArchiveFormatPax, longEntries, 2u),
+               "create pax_long.cbt (PAX)");
+    XSCBook *pax = nil;
+    err = nil;
+    handle {
+        pax = tryValue([XSCBook openPath:paxPath.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(pax != nil && pax.pageCount == 2u, "open pax_long.cbt failed: %s",
+               err ? err.message.utf8 : "");
+    if (pax && pax.pageCount == 2u) {
+        XSC_ASSERT([[pax pageNameAtIndex:0u] hasSuffixUTF8:"page2.png"], "PAX longname natural sort page 0");
+        XSCOptData p0 = tryOptional([pax readPageDataAtIndex:0u]);
+        bool pm0 = match(p0) { case .Some(let d) => [d isEqualToData:png1]; case .None => false; };
+        XSC_ASSERT(pm0, "CBT PAX longname page 0 matches");
+    }
+
+    // 3. GNU tar LongName ('L') CBT (>100-byte pathname)
+    XSCString *gnuPath = [tmpDir stringByAppendingPathComponent:"gnu_long.cbt"];
+    XSC_ASSERT(writeTestLibarchive(gnuPath.utf8, TestArchiveFormatGnuTar, longEntries, 2u),
+               "create gnu_long.cbt (GNU LongName)");
+    XSCBook *gnu = nil;
+    err = nil;
+    handle {
+        gnu = tryValue([XSCBook openPath:gnuPath.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(gnu != nil && gnu.pageCount == 2u, "open gnu_long.cbt failed: %s",
+               err ? err.message.utf8 : "");
+    if (gnu && gnu.pageCount == 2u) {
+        XSCOptData g1 = tryOptional([gnu readPageDataAtIndex:1u]);
+        bool gm1 = match(g1) { case .Some(let d) => [d isEqualToData:png2]; case .None => false; };
+        XSC_ASSERT(gm1, "CBT GNU LongName page 1 matches");
+    }
+
+    // 4. CB7 (7zip created in-process via libarchive)
+    XSCString *cb7Path = [tmpDir stringByAppendingPathComponent:"sample.cb7"];
+    XSC_ASSERT(writeTestLibarchive(cb7Path.utf8, TestArchiveFormat7zip, tarEntries, 2u),
+               "create sample.cb7 (libarchive 7z)");
+    XSCBook *cb7 = nil;
+    err = nil;
+    handle {
+        cb7 = tryValue([XSCBook openPath:cb7Path.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(cb7 != nil && cb7.pageCount == 2u, "open sample.cb7 failed: %s",
+               err ? err.message.utf8 : "");
+    if (cb7 && cb7.pageCount == 2u) {
+        XSCOptData d0 = tryOptional([cb7 readPageDataAtIndex:0u]);
+        XSCOptData d1 = tryOptional([cb7 readPageDataAtIndex:1u]);
+        bool m0 = match(d0) { case .Some(let d) => [d isEqualToData:png1]; case .None => false; };
+        bool m1 = match(d1) { case .Some(let d) => [d isEqualToData:png2]; case .None => false; };
+        XSC_ASSERT(m0, "CB7 page 0 matches");
+        XSC_ASSERT(m1, "CB7 page 1 matches");
+    }
+}
+
+#pragma mark - Test 5: Directory Scan, Symlink Escape, Cancellation & Adjacent Volumes
+
+static void testDirectoryAndAdjacentVolumes(XSCString *tmpDir, XSCData *png1, XSCData *png2) {
+    printf("[TEST] Directory Scan, Symlink Escape, Cancellation & Adjacent Volumes\n");
+
+    XSCString *outsideFile = [tmpDir stringByAppendingPathComponent:"outside.png"];
+    writeDataToFile(outsideFile.utf8, png1);
+
+    XSCString *dir = [tmpDir stringByAppendingPathComponent:"dirbook"];
+    XSCString *sub = [dir stringByAppendingPathComponent:"sub"];
+    makeDirs(sub.utf8);
+    writeDataToFile([dir stringByAppendingPathComponent:"02.png"].utf8, png1);
+    writeDataToFile([sub stringByAppendingPathComponent:"10.png"].utf8, png2);
+    XSCString *escapeLink = [dir stringByAppendingPathComponent:"01_escape.png"];
+    int symRc = symlink(outsideFile.utf8, escapeLink.utf8);
+    XSC_ASSERT(symRc == 0, "create symlink escape fixture");
+
+    XSCBook *book = nil;
+    XSCError *err = nil;
+    handle {
+        book = tryValue([XSCBook openPath:dir.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(book != nil && book.pageCount == 2u,
+               "dirbook has 2 safe pages (symlink skipped), got %zu (err=%s)",
+               book ? book.pageCount : 0u, err ? err.message.utf8 : "");
+
+    // Cancellation
+    _Atomic(bool) cancelled = true;
+    XSCBook *cBook = nil;
+    int cancelErrCode = 0;
+    handle {
+        cBook = tryValue([XSCBook openPath:dir.utf8 cancelFlag:&cancelled]);
+    } catch(XSCError *e) {
+        cancelErrCode = e.code;
+    }
+    XSC_ASSERT(cBook == nil && cancelErrCode == XSCArchiveErrorCancelled,
+               "pre-cancelled open aborts with XSCArchiveErrorCancelled (got %d)", cancelErrCode);
+
+    XSCString *moved = [tmpDir stringByAppendingPathComponent:"renamed-dirbook"];
+    XSC_ASSERT(rename(dir.utf8, moved.utf8) == 0, "rename the directory while its book is open");
+    XSCData *rootPage = nil;
+    XSCData *nestedPage = nil;
+    if (book) {
+        handle {
+            rootPage = tryValue([book readPageDataAtIndex:0u]);
+            nestedPage = tryValue([book readPageDataAtIndex:1u]);
+        } catch (XSCError *e) { (void)e; }
+    }
+    XSC_ASSERT(rootPage != nil && [rootPage isEqualToData:png1], "read root page after directory rename");
+    XSC_ASSERT(nestedPage != nil && [nestedPage isEqualToData:png2], "read nested page after directory rename");
+
+    // Adjacent volumes
+    XSCString *seriesDir = [tmpDir stringByAppendingPathComponent:"series"];
+    makeDirs(seriesDir.utf8);
+    TestZipEntry e[] = { { "p1.png", png1, false, false, 0ULL } };
+    XSCString *v1 = [seriesDir stringByAppendingPathComponent:"vol1.cbz"];
+    XSCString *v2 = [seriesDir stringByAppendingPathComponent:"vol2.cbz"];
+    XSCString *v10 = [seriesDir stringByAppendingPathComponent:"vol10.cbz"];
+    writeTestZIP(v1.utf8, e, 1u, false);
+    writeTestZIP(v2.utf8, e, 1u, false);
+    writeTestZIP(v10.utf8, e, 1u, false);
+    writeFileBytes([seriesDir stringByAppendingPathComponent:"readme.txt"].utf8, "readme", 6u);
+
+    XSCOptString nextOpt = [XSCBook adjacentVolumePathFor:v2.utf8 step:1 cancelFlag:NULL];
+    XSCOptString prevOpt = [XSCBook adjacentVolumePathFor:v2.utf8 step:-1 cancelFlag:NULL];
+    XSCOptString pastEndOpt = [XSCBook adjacentVolumePathFor:v10.utf8 step:1 cancelFlag:NULL];
+
+    bool nextOk = match(nextOpt) {
+        case .Some(let p) => [[p lastPathComponent] isEqualToUTF8:"vol10.cbz"];
+        case .None => false;
+    };
+    bool prevOk = match(prevOpt) {
+        case .Some(let p) => [[p lastPathComponent] isEqualToUTF8:"vol1.cbz"];
+        case .None => false;
+    };
+    bool pastEndOk = match(pastEndOpt) {
+        case .Some(let p) => (p == nil);
+        case .None => true;
+    };
+    XSC_ASSERT(nextOk, "next volume after vol2 is vol10");
+    XSC_ASSERT(prevOk, "prev volume before vol2 is vol1");
+    XSC_ASSERT(pastEndOk, "no volume after vol10");
+}
+
+#pragma mark - Test 6: ReaderModel Spread / RTL / LTR / 2-Turn Predictor / Jump / Zero-Hop Cache Hit
+
+static void testReaderModelAndPredictor(XSCString *tmpDir, XSCData *png1) {
+    printf("[TEST] ReaderModel Spread/RTL/LTR/Predictor/Jump/Zero-Hop Cache Hit\n");
+
+    XSCIndexList *fwd = [XSCReaderModel prefetchOrderForCurrentIndex:5u
+                                                           pageCount:20u
+                                                            pageMode:XSCPageModeSingle
+                                            consecutiveBackwardTurns:0u];
+    XSC_ASSERT(fwd.count > 0u && [fwd valueAtIndex:0u] == 6u,
+               "forward predictor starts at +1 (6)");
+
+    XSCIndexList *bwd = [XSCReaderModel prefetchOrderForCurrentIndex:10u
+                                                           pageCount:20u
+                                                            pageMode:XSCPageModeSingle
+                                            consecutiveBackwardTurns:2u];
+    XSC_ASSERT(bwd.count > 0u && [bwd valueAtIndex:0u] == 9u,
+               "2-turn backward predictor flips to -1 (9)");
+
+    // Build a 6-page CBZ
+    XSCString *cbz = [tmpDir stringByAppendingPathComponent:"nav.cbz"];
+    TestZipEntry entries[6];
+    char names[6][16];
+    for (int i = 0; i < 6; i++) {
+        snprintf(names[i], sizeof(names[i]), "p%02d.png", i + 1);
+        entries[i] = (TestZipEntry){ names[i], png1, false, false, 0ULL };
+    }
+    writeTestZIP(cbz.utf8, entries, 6u, false);
+
+    XSCImageStore *store = [[XSCImageStore alloc] initWithMaxEntryCount:12u
+                                                          maxByteBudget:32u * 1024u * 1024u];
+    defer { [store shutdown]; }
+    XSCReaderModel *model = [[XSCReaderModel alloc] initWithImageStore:store];
+    TestReaderDelegate *del = [[TestReaderDelegate alloc] init];
+    model.delegate = del;
+
+    [model openPath:cbz.utf8];
+    pumpMainUntil(^bool {
+        return match(model.book) {
+            case .Some(let b) => (b != nil);
+            case .None => false;
+        };
+    }, 3000.0);
+
+    XSCBook *openedBook = match(model.book) {
+        case .Some(let b) => b;
+        case .None => (XSCBook *)nil;
+    };
+    XSC_ASSERT(openedBook != nil && openedBook.pageCount == 6u, "model opened 6-page book");
+    XSC_ASSERT(model.currentIndex == 0u, "starts at index 0");
+    XSC_ASSERT([model.pageIndicatorText isEqualToUTF8:"1 / 6"],
+               "single-page indicator is '1 / 6' (got '%s')", model.pageIndicatorText.utf8);
+
+    // Jump math
+    XSC_ASSERT([model jumpToOneBasedPageNumber:3], "jump to page 3 succeeds");
+    XSC_ASSERT(model.currentIndex == 2u, "index is 2 after jump to 3");
+    XSC_ASSERT(![model jumpToOneBasedPageNumber:0], "jump to 0 rejected");
+    XSC_ASSERT(![model jumpToOneBasedPageNumber:99], "jump to 99 rejected");
+
+    // Double-page LTR vs RTL visual order
+    [model togglePageMode]; // Single -> Double
+    XSC_ASSERT(model.pageMode == XSCPageModeDouble, "toggled to double mode");
+    XSCIndexList *ltrVis = model.visualPageIndices;
+    XSC_ASSERT(ltrVis.count == 2u && [ltrVis valueAtIndex:0u] < [ltrVis valueAtIndex:1u],
+               "LTR double visual order is ascending");
+    XSC_ASSERT([model.pageIndicatorText hasSuffixUTF8:" / 6"] &&
+               [model.pageIndicatorText hasPrefixUTF8:"3"],
+               "double-page indicator reflects spread (got '%s')", model.pageIndicatorText.utf8);
+
+    [model toggleDirection]; // LTR -> RTL
+    XSC_ASSERT(model.direction == XSCReadingDirectionRTL, "toggled to RTL");
+    XSCIndexList *rtlVis = model.visualPageIndices;
+    XSC_ASSERT(rtlVis.count == 2u && [rtlVis valueAtIndex:0u] > [rtlVis valueAtIndex:1u],
+               "RTL double visual order is reversed (right page on left)");
+
+    // Zero-hop synchronous cache-hit fast path:
+    // Switch back to Single mode, warm page index 1 in the image store, then jump to page 2
+    // and assert the delegate receives the decoded page synchronously WITHOUT pumping!
+    [model togglePageMode]; // Double -> Single
+    if (openedBook != nil) {
+        __block bool warmed = false;
+        [store requestPageForBook:openedBook index:1u priority:true
+                       completion:^(XSCOptDecodedPage page, bool failed) {
+            (void)page; (void)failed;
+            warmed = true;
+        }];
+        pumpMainUntil(^bool { return warmed; }, 3000.0);
+
+        size_t updatesBefore = del.displayUpdates;
+        del.lastLeft = nil;
+        del.lastLoading = true;
+        bool jumped = [model jumpToOneBasedPageNumber:2];
+        XSC_ASSERT(jumped && del.displayUpdates > updatesBefore && del.lastLeft != nil && !del.lastLoading,
+                   "zero-hop cache hit delivered page synchronously without run-loop pump");
+    }
+}
+
+#pragma mark - Test 7: XSCImageStore Cache, Gray8, RGBA8, EXIF, Coalescing, GIF, Eviction
+
+static void testImageStoreCachePurgeableGrayGIFExif(XSCString *tmpDir) {
+    printf("[TEST] XSCImageStore Cache, Gray8, RGBA8, EXIF, Coalescing, GIF & Eviction\n");
+
+    XSCData *grayRGBPng = makeSyntheticPNG(256u, 256u, true);
+    XSCData *colorPng = makeSyntheticPNG(256u, 256u, false);
+    XSCData *gifData = makeAnimatedGIFData(64u, 64u);
+    XSCData *exifJpg = makeSyntheticJPEG(120u, 80u, false, 6u); // Orientation 6 = 90 deg CW
+
+    XSCString *cbz = [tmpDir stringByAppendingPathComponent:"imgstore.cbz"];
+    TestZipEntry entries[] = {
+        { "01_gray.png", grayRGBPng, false, false, 0ULL },
+        { "02_color.png", colorPng, false, false, 0ULL },
+        { "03_anim.gif", gifData, false, false, 0ULL },
+        { "04_exif.jpg", exifJpg, false, false, 0ULL },
+        { "05_extra.png", colorPng, false, false, 0ULL },
+    };
+    XSC_ASSERT(writeTestZIP(cbz.utf8, entries, 5u, false), "write imgstore.cbz");
+
+    XSCBook *book = nil;
+    XSCError *err = nil;
+    handle {
+        book = tryValue([XSCBook openPath:cbz.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        err = e;
+    }
+    XSC_ASSERT(book != nil && book.pageCount == 5u, "open imgstore.cbz (err=%s)",
+               err ? err.message.utf8 : "");
+    if (!book) return;
+
+    XSCImageStore *store = [[XSCImageStore alloc] initWithMaxEntryCount:3u
+                                                          maxByteBudget:64u * 1024u * 1024u];
+    defer { [store shutdown]; }
+
+    // 1. Request Coalescing on Main Thread + Gray8 Chroma-Probe Repack
+    __block int callbacks = 0;
+    __block bool allOnMain = true;
+    __block XSCDecodedPage *grayPage = nil;
+    for (int i = 0; i < 3; i++) {
+        [store requestPageForBook:book index:0u priority:true
+                       completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+            if (!xsc_is_main_thread()) allOnMain = false;
+            if (!failed) {
+                match(pageOpt) {
+                    case .Some(let p): { grayPage = p; }
+                    case .None: { }
+                }
+            }
+            callbacks++;
+        }];
+    }
+    pumpMainUntil(^bool { return callbacks >= 3; }, 3000.0);
+    XSC_ASSERT(callbacks == 3 && allOnMain, "coalesced requests all completed on main thread");
+    XSC_ASSERT(grayPage != nil && grayPage.isGrayscale, "RGB-encoded grayscale PNG repacked to Gray8");
+    XSC_ASSERT(grayPage != nil && grayPage.pixelWidth == 256u && grayPage.pixelHeight == 256u,
+               "grayPage dimensions 256x256");
+
+    // 2. Color PNG stays RGBA8
+    __block XSCDecodedPage *colorPage = nil;
+    __block bool doneColor = false;
+    [store requestPageForBook:book index:1u priority:true
+                   completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+        (void)failed;
+        colorPage = match(pageOpt) {
+            case .Some(let p) => p;
+            case .None => (XSCDecodedPage *)nil;
+        };
+        doneColor = true;
+    }];
+    pumpMainUntil(^bool { return doneColor; }, 3000.0);
+    XSC_ASSERT(colorPage != nil && !colorPage.isGrayscale, "color PNG stays RGBA8");
+    XSC_ASSERT(colorPage != nil && colorPage.bytesPerRow >= 256u * 4u, "color PNG stride >= 1024");
+
+    // 3. Animated GIF multi-frame decode
+    __block XSCDecodedPage *gifPage = nil;
+    __block bool doneGif = false;
+    [store requestPageForBook:book index:2u priority:true
+                   completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+        (void)failed;
+        gifPage = match(pageOpt) {
+            case .Some(let p) => p;
+            case .None => (XSCDecodedPage *)nil;
+        };
+        doneGif = true;
+    }];
+    pumpMainUntil(^bool { return doneGif; }, 3000.0);
+    bool hasGifRawData = false;
+    if (gifPage != nil) {
+        hasGifRawData = match(gifPage.gifData) {
+            case .Some(let d) => (d.length > 0u);
+            case .None => false;
+        };
+    }
+    XSC_ASSERT(gifPage != nil && gifPage.isAnimatedGIF && gifPage.gifFrameCount >= 2u && hasGifRawData,
+               "animated GIF multi-frame decode detected (frames=%zu)",
+               gifPage ? gifPage.gifFrameCount : 0u);
+    if (gifPage != nil && gifPage.gifFrameCount >= 2u) {
+        uint32_t delay0 = 0u, delay1 = 0u;
+        const uint8_t *f0 = [gifPage gifFramePixelsAtIndex:0u outDelayMs:&delay0];
+        const uint8_t *f1 = [gifPage gifFramePixelsAtIndex:1u outDelayMs:&delay1];
+        XSC_ASSERT(f0 != NULL && f1 != NULL && delay0 >= 20u && delay1 >= 20u,
+                   "animated GIF frames have valid RGBA buffers & delays (%u ms, %u ms)", delay0, delay1);
+        uint64_t nextChange = 0u;
+        uint64_t elapsed = 1000u * ((uint64_t)delay0 + delay1) + delay0;
+        XSC_ASSERT([gifPage gifFrameAtElapsedMs:elapsed nextChangeMs:&nextChange] == 1u &&
+                   nextChange == elapsed + delay1, "GIF timeline skips missed frames without accumulating drift");
+        if (f0 != NULL && f1 != NULL) {
+            XSC_ASSERT(f0[0] != f1[0] && f0[1] != f1[1],
+                       "animated GIF frame 0 and frame 1 pixels differ as encoded");
+        }
+    }
+
+    // 4. EXIF Orientation 6 (90 deg CW): raw 120x80 -> oriented 80x120
+    __block XSCDecodedPage *exifPage = nil;
+    __block bool doneExif = false;
+    [store requestPageForBook:book index:3u priority:true
+                   completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+        (void)failed;
+        exifPage = match(pageOpt) {
+            case .Some(let p) => p;
+            case .None => (XSCDecodedPage *)nil;
+        };
+        doneExif = true;
+    }];
+    pumpMainUntil(^bool { return doneExif; }, 3000.0);
+    XSC_ASSERT(exifPage != nil && exifPage.exifOrientation == 6u,
+               "EXIF orientation 6 parsed (got %u)", exifPage ? exifPage.exifOrientation : 0u);
+    if (exifPage != nil) {
+        XSCSizeF oriented = exifPage.orientedPixelSize;
+        XSC_ASSERT(exifPage.pixelWidth == 120u && exifPage.pixelHeight == 80u,
+                   "EXIF raw dimensions 120x80 (got %zux%zu)",
+                   exifPage.pixelWidth, exifPage.pixelHeight);
+        XSC_ASSERT(oriented.width == 80.0f && oriented.height == 120.0f,
+                   "EXIF orientation 6 swaps orientedPixelSize to 80x120 (got %.0fx%.0f)",
+                   oriented.width, oriented.height);
+    }
+
+    // 5. Bounded eviction (maxEntryCount = 3, requesting 5th entry keeps count <= 3)
+    __block bool doneExtra = false;
+    [store requestPageForBook:book index:4u priority:true
+                   completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+        (void)pageOpt; (void)failed;
+        doneExtra = true;
+    }];
+    pumpMainUntil(^bool { return doneExtra; }, 3000.0);
+    XSC_ASSERT(store.currentEntryCount <= 3u,
+               "cache bounded to maxEntryCount=3 (got %zu)", store.currentEntryCount);
+
+    uint32_t pixelBeforeReset = 0u;
+    if (colorPage) memcpy(&pixelBeforeReset, colorPage.pixels, sizeof(pixelBeforeReset));
+
+    [store resetKeepingBook:Some(XSCBook *, book)];
+    XSC_ASSERT(store.currentEntryCount > 0u, "resetKeepingBook:Some(book) preserves active book entries");
+    [store resetKeepingBook:None(XSCBook *)];
+    XSC_ASSERT(store.currentEntryCount == 0u && store.currentByteCount == 0u,
+               "resetKeepingBook:None clears cache");
+    if (colorPage) {
+        uint32_t pixelAfterReset = 0u;
+        memcpy(&pixelAfterReset, colorPage.pixels, sizeof(pixelAfterReset));
+        XSC_ASSERT(pixelBeforeReset == pixelAfterReset, "a retained page keeps its pixels after eviction");
+    }
+}
+
+#pragma mark - Adversarial Payload & Archive Builders
+
+static XSCData *makeSyntheticBMP(size_t w, size_t h, uint16_t bpp) {
+    size_t srcBpp = (size_t)(bpp / 8u);
+    size_t rowBytes = ((w * srcBpp) + 3u) & ~(size_t)3u;
+    size_t pixelBytes = rowBytes * h;
+    size_t totalBytes = 54u + pixelBytes;
+    uint8_t *buf = (uint8_t *)calloc(1u, totalBytes);
+    if (!buf) return [XSCData emptyData];
+
+    buf[0] = 'B'; buf[1] = 'M';
+    buf[2] = (uint8_t)(totalBytes & 0xFFu);
+    buf[3] = (uint8_t)((totalBytes >> 8) & 0xFFu);
+    buf[4] = (uint8_t)((totalBytes >> 16) & 0xFFu);
+    buf[5] = (uint8_t)((totalBytes >> 24) & 0xFFu);
+    buf[10] = 54u; // pixelOffset
+    buf[14] = 40u; // BITMAPINFOHEADER
+    buf[18] = (uint8_t)(w & 0xFFu); buf[19] = (uint8_t)((w >> 8) & 0xFFu);
+    buf[22] = (uint8_t)(h & 0xFFu); buf[23] = (uint8_t)((h >> 8) & 0xFFu);
+    buf[26] = 1u;  // planes
+    buf[28] = (uint8_t)bpp;
+
+    uint8_t *px = buf + 54u;
+    for (size_t y = 0u; y < h; y++) {
+        for (size_t x = 0u; x < w; x++) {
+            uint8_t *p = px + y * rowBytes + x * srcBpp;
+            p[0] = (uint8_t)((x * 7u) & 0xFFu); // B
+            p[1] = (uint8_t)((y * 5u) & 0xFFu); // G
+            p[2] = (uint8_t)((x + y) & 0xFFu);  // R
+            if (srcBpp == 4u) p[3] = 255u;
+        }
+    }
+    return [XSCData dataTakingBytesNoCopy:buf length:totalBytes];
+}
+
+static XSCData *makeHugeDimensionPNG(uint32_t w, uint32_t h, uint8_t colorType) {
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+    static const uint8_t sig[8] = { 0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au };
+    xscBufAppend(&out, sig, sizeof(sig));
+
+    uint8_t ihdr[17] = {
+        'I', 'H', 'D', 'R',
+        (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
+        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h,
+        8u, colorType, 0u, 0u, 0u
+    };
+    uint8_t lenBE[4] = { 0u, 0u, 0u, 13u };
+    xscBufAppend(&out, lenBE, 4u);
+    xscBufAppend(&out, ihdr, sizeof(ihdr));
+    uint32_t crc = (uint32_t)crc32(0L, ihdr, sizeof(ihdr));
+    uint8_t crcBE[4] = {
+        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc
+    };
+    xscBufAppend(&out, crcBE, 4u);
+    return xscBufTakeData(&out);
+}
+
+static XSCData *makeHugeDimensionTIFF(uint32_t w, uint32_t h) {
+    // Little-endian classic TIFF with IFD0 claiming w x h + huge StripOffsets
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+    xscBufAppend(&out, "II", 2u);
+    xscBufAppendU16(&out, 42u);
+    xscBufAppendU32(&out, 8u); // IFD0 offset
+    xscBufAppendU16(&out, 5u); // 5 entries
+    // Tag 256 ImageWidth (LONG=4, count=1)
+    xscBufAppendU16(&out, 256u); xscBufAppendU16(&out, 4u); xscBufAppendU32(&out, 1u); xscBufAppendU32(&out, w);
+    // Tag 257 ImageLength (LONG=4, count=1)
+    xscBufAppendU16(&out, 257u); xscBufAppendU16(&out, 4u); xscBufAppendU32(&out, 1u); xscBufAppendU32(&out, h);
+    // Tag 258 BitsPerSample (SHORT=3, count=1, val=8)
+    xscBufAppendU16(&out, 258u); xscBufAppendU16(&out, 3u); xscBufAppendU32(&out, 1u); xscBufAppendU32(&out, 8u);
+    // Tag 259 Compression (SHORT=3, count=1, val=1)
+    xscBufAppendU16(&out, 259u); xscBufAppendU16(&out, 3u); xscBufAppendU32(&out, 1u); xscBufAppendU32(&out, 1u);
+    // Tag 273 StripOffsets (LONG=4, count=1, huge offset 0x7FFFFFF0)
+    xscBufAppendU16(&out, 273u); xscBufAppendU16(&out, 4u); xscBufAppendU32(&out, 1u); xscBufAppendU32(&out, 0x7FFFFFF0u);
+    xscBufAppendU32(&out, 0u); // next IFD = 0
+    return xscBufTakeData(&out);
+}
+
+static XSCData *makeHugeDimensionGIF(uint16_t screenW, uint16_t screenH, uint16_t frameW, uint16_t frameH) {
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+    xscBufAppend(&out, "GIF89a", 6u);
+    xscBufAppendU16(&out, screenW);
+    xscBufAppendU16(&out, screenH);
+    xscBufAppendByte(&out, 0x80u); // 2-color GCT
+    xscBufAppendByte(&out, 0u);
+    xscBufAppendByte(&out, 0u);
+    const uint8_t gct[6] = { 0u, 0u, 0u, 255u, 255u, 255u };
+    xscBufAppend(&out, gct, sizeof(gct));
+    xscBufAppendByte(&out, 0x2Cu);
+    xscBufAppendU16(&out, 0u);
+    xscBufAppendU16(&out, 0u);
+    xscBufAppendU16(&out, frameW);
+    xscBufAppendU16(&out, frameH);
+    xscBufAppendByte(&out, 0u);
+    xscBufAppendByte(&out, 2u);    // minCodeSize
+    xscBufAppendByte(&out, 1u);    // 1-byte sub-block
+    xscBufAppendByte(&out, 0x05u); // EOI
+    xscBufAppendByte(&out, 0u);    // sub-block terminator
+    xscBufAppendByte(&out, 0x3Bu); // trailer
+    return xscBufTakeData(&out);
+}
+
+static XSCData *makeHugeDimensionBMP(int32_t rawW, int32_t rawH, uint16_t bpp, uint32_t pixelOff) {
+    uint8_t hdr[64];
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = 64u;
+    hdr[10] = (uint8_t)(pixelOff & 0xFFu);
+    hdr[11] = (uint8_t)((pixelOff >> 8) & 0xFFu);
+    hdr[14] = 40u;
+    uint32_t uw = (uint32_t)rawW;
+    uint32_t uh = (uint32_t)rawH;
+    hdr[18] = (uint8_t)(uw & 0xFFu); hdr[19] = (uint8_t)((uw >> 8) & 0xFFu);
+    hdr[20] = (uint8_t)((uw >> 16) & 0xFFu); hdr[21] = (uint8_t)((uw >> 24) & 0xFFu);
+    hdr[22] = (uint8_t)(uh & 0xFFu); hdr[23] = (uint8_t)((uh >> 8) & 0xFFu);
+    hdr[24] = (uint8_t)((uh >> 16) & 0xFFu); hdr[25] = (uint8_t)((uh >> 24) & 0xFFu);
+    hdr[26] = 1u;
+    hdr[28] = (uint8_t)bpp;
+    return [XSCData dataWithBytes:hdr length:sizeof(hdr)];
+}
+
+static XSCData *makeHugeDimensionJPEG(uint16_t w, uint16_t h) {
+    // SOI + corrupt EXIF APP1 (OOB IFD offset) + SOF0 claiming w x h + truncated SOS
+    const uint8_t raw[] = {
+        0xFFu, 0xD8u,
+        // APP1 EXIF with out-of-bounds IFD0 offset 0x00FFFFFF
+        0xFFu, 0xE1u, 0x00u, 0x14u,
+        'E', 'x', 'i', 'f', 0x00u, 0x00u,
+        'I', 'I', 0x2Au, 0x00u, 0xFFu, 0xFFu, 0xFFu, 0x00u, 0x00u, 0x00u,
+        // SOF0 (baseline DCT, 8-bit, 3 components)
+        0xFFu, 0xC0u, 0x00u, 0x11u, 0x08u,
+        (uint8_t)(h >> 8), (uint8_t)(h & 0xFFu),
+        (uint8_t)(w >> 8), (uint8_t)(w & 0xFFu),
+        0x03u,
+        0x01u, 0x11u, 0x00u,
+        0x02u, 0x11u, 0x00u,
+        0x03u, 0x11u, 0x00u,
+        0xFFu, 0xDAu, 0x00u, 0x0Cu, 0x03u, 0x01u, 0x00u, 0x02u, 0x00u, 0x03u, 0x00u, 0x00u, 0x3Fu, 0x00u,
+        0x00u, 0xFFu, 0xD9u
+    };
+    return [XSCData dataWithBytes:raw length:sizeof(raw)];
+}
+
+static XSCData *makeMalformedISOBMFF(const char brand[4], bool includeFakeIspe) {
+    XSCByteBuf out = {0};
+    defer { xscBufFree(&out); }
+    // ftyp box (20 bytes)
+    const uint8_t ftypHdr[8] = { 0u, 0u, 0u, 20u, 'f', 't', 'y', 'p' };
+    xscBufAppend(&out, ftypHdr, 8u);
+    xscBufAppend(&out, brand, 4u);
+    const uint8_t minorAndCompat[8] = { 0u, 0u, 0u, 0u, (uint8_t)brand[0], (uint8_t)brand[1], (uint8_t)brand[2], (uint8_t)brand[3] };
+    xscBufAppend(&out, minorAndCompat, 8u);
+    if (includeFakeIspe) {
+        // Fake ispe box claiming 100000 x 100000 followed by garbage
+        const uint8_t ispe[20] = {
+            0u, 0u, 0u, 20u, 'i', 's', 'p', 'e',
+            0u, 0u, 0u, 0u,
+            0x00u, 0x01u, 0x86u, 0xA0u, // 100000
+            0x00u, 0x01u, 0x86u, 0xA0u, // 100000
+        };
+        xscBufAppend(&out, ispe, sizeof(ispe));
+        const uint8_t junk[16] = { 0xDEu, 0xADu, 0xBEu, 0xEFu, 0x01u, 0x02u, 0x03u, 0x04u,
+                                   0xFFu, 0xEEu, 0xDDu, 0xCCu, 0xBBu, 0xAAu, 0x99u, 0x88u };
+        xscBufAppend(&out, junk, sizeof(junk));
+    }
+    return xscBufTakeData(&out);
+}
+
+static bool writeRawNameSingleEntryZIP(const char *path,
+                                       const char *rawName,
+                                       size_t nameLen,
+                                       uint16_t method,
+                                       const uint8_t *payload,
+                                       size_t compSize,
+                                       size_t uncompSize,
+                                       const uint8_t *cdExtra,
+                                       size_t cdExtraLen,
+                                       bool saturate32Fields) {
+    XSCByteBuf archive = {0};
+    XSCByteBuf central = {0};
+    defer { xscBufFree(&archive); }
+    defer { xscBufFree(&central); }
+
+    xscBufAppendU32(&archive, 0x04034b50u);
+    xscBufAppendU16(&archive, 20u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, method);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU32(&archive, 0u);
+    xscBufAppendU32(&archive, (uint32_t)compSize);
+    xscBufAppendU32(&archive, (uint32_t)uncompSize);
+    xscBufAppendU16(&archive, (uint16_t)nameLen);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppend(&archive, rawName, nameLen);
+    if (payload && compSize > 0u) {
+        xscBufAppend(&archive, payload, compSize);
+    }
+
+    uint32_t cdOffset = (uint32_t)archive.len;
+    xscBufAppendU32(&central, 0x02014b50u);
+    xscBufAppendU16(&central, (uint16_t)((3u << 8) | 20u));
+    xscBufAppendU16(&central, 20u);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU16(&central, method);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU32(&central, 0u);
+    xscBufAppendU32(&central, saturate32Fields ? 0xFFFFFFFFu : (uint32_t)compSize);
+    xscBufAppendU32(&central, saturate32Fields ? 0xFFFFFFFFu : (uint32_t)uncompSize);
+    xscBufAppendU16(&central, (uint16_t)nameLen);
+    xscBufAppendU16(&central, (uint16_t)cdExtraLen);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU16(&central, 0u);
+    xscBufAppendU32(&central, 0100644u << 16);
+    xscBufAppendU32(&central, saturate32Fields ? 0xFFFFFFFFu : 0u);
+    xscBufAppend(&central, rawName, nameLen);
+    if (cdExtra && cdExtraLen > 0u) {
+        xscBufAppend(&central, cdExtra, cdExtraLen);
+    }
+
+    xscBufAppend(&archive, central.data, central.len);
+    xscBufAppendU32(&archive, 0x06054b50u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, 0u);
+    xscBufAppendU16(&archive, 1u);
+    xscBufAppendU16(&archive, 1u);
+    xscBufAppendU32(&archive, (uint32_t)central.len);
+    xscBufAppendU32(&archive, cdOffset);
+    xscBufAppendU16(&archive, 0u);
+    return writeFileBytes(path, archive.data, archive.len);
+}
+
+static void fillTarHeaderChecksum(uint8_t blk[512]) {
+    memset(blk + 148, ' ', 8u);
+    uint32_t sum = 0u;
+    for (int i = 0; i < 512; i++) {
+        sum += blk[i];
+    }
+    snprintf((char *)(blk + 148), 8u, "%06o", sum);
+    blk[154] = '\0';
+    blk[155] = ' ';
+}
+
+static int openExpectErrorCode(const char *path) {
+    XSCBook *b = nil;
+    int code = 0;
+    handle {
+        b = tryValue([XSCBook openPath:path cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        code = e.code;
+    }
+    return (b == nil) ? code : -1;
+}
+
+#pragma mark - Test 8: Adversarial Malformed / Truncated / Oversized Codecs & Negative Cache
+
+static void testAdversarialCodecsAndNegativeCache(XSCString *tmpDir, XSCData *validPng) {
+    printf("[TEST] Adversarial Codecs (JPEG/PNG/GIF/WebP/TIFF/BMP/AVIF/HEIF) & Negative Cache\n");
+
+    // 1. Valid 24-bit and 32-bit BMP decode verification
+    XSCData *bmp24 = makeSyntheticBMP(32u, 24u, 24u);
+    XSCData *bmp32 = makeSyntheticBMP(32u, 24u, 32u);
+    XSCString *bmpCbz = [tmpDir stringByAppendingPathComponent:"valid_bmp.cbz"];
+    TestZipEntry bmpEntries[] = {
+        { "01.bmp", bmp24, false, false, 0ULL },
+        { "02.bmp", bmp32, false, false, 0ULL },
+    };
+    XSC_ASSERT(writeTestZIP(bmpCbz.utf8, bmpEntries, 2u, false), "write valid_bmp.cbz");
+    XSCBook *bmpBook = nil;
+    handle { bmpBook = tryValue([XSCBook openPath:bmpCbz.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    XSC_ASSERT(bmpBook != nil && bmpBook.pageCount == 2u, "open valid_bmp.cbz");
+    if (bmpBook) {
+        XSCImageStore *bmpStore = [[XSCImageStore alloc] initWithMaxEntryCount:4u maxByteBudget:8u * 1024u * 1024u];
+        defer { [bmpStore shutdown]; }
+        __block int bmpDone = 0;
+        __block bool bmpOk = true;
+        for (size_t i = 0u; i < 2u; i++) {
+            [bmpStore requestPageForBook:bmpBook index:i priority:true
+                              completion:^(XSCOptDecodedPage pOpt, bool failed) {
+                bool ok = !failed && match(pOpt) {
+                    case .Some(let p) => (p != nil && p.pixelWidth == 32u && p.pixelHeight == 24u);
+                    case .None => false;
+                };
+                if (!ok) bmpOk = false;
+                bmpDone++;
+            }];
+        }
+        pumpMainUntil(^bool { return bmpDone >= 2; }, 3000.0);
+        XSC_ASSERT(bmpDone == 2 && bmpOk, "valid 24-bit and 32-bit BMP decoded cleanly");
+    }
+
+    // 2. Comprehensive adversarial / malformed / truncated / oversized payloads across ALL codecs
+    XSCData *validJpg = makeSyntheticJPEG(64u, 64u, false, 0u);
+    XSCData *validGif = makeAnimatedGIFData(32u, 32u);
+
+    const uint8_t oneByte[1] = { 0xFFu };
+    const uint8_t garbage[48] = {
+        0x13u, 0x37u, 0xCAu, 0xFEu, 0xBAu, 0xBEu, 0x00u, 0xFFu,
+        0x55u, 0xAAu, 0x12u, 0x34u, 0x56u, 0x78u, 0x9Au, 0xBCu,
+        0xDEu, 0xF0u, 0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u,
+        0x77u, 0x88u, 0x99u, 0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu,
+        0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u,
+        0xF1u, 0xF2u, 0xF3u, 0xF4u, 0xF5u, 0xF6u, 0xF7u, 0xF8u,
+    };
+    const uint8_t jpgTruncHdr[2] = { 0xFFu, 0xD8u };
+    const uint8_t jpgGarbage[20] = { 0xFFu, 0xD8u, 0xFFu, 0xE0u, 0x00u, 0x10u, 0xDEu, 0xADu, 0xBEu, 0xEFu,
+                                     0xFFu, 0xFFu, 0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u };
+    const uint8_t pngTruncSig[8] = { 0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au };
+    const uint8_t pngGarbage[24] = { 0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au,
+                                     0xFFu, 0xFFu, 0xFFu, 0xFFu, 'I', 'H', 'D', 'R',
+                                     0x12u, 0x34u, 0x56u, 0x78u, 0x9Au, 0xBCu, 0xDEu, 0xF0u };
+    const uint8_t gifTruncHdr[6] = { 'G', 'I', 'F', '8', '9', 'a' };
+    const uint8_t gifGarbage[20] = { 'G', 'I', 'F', '8', '9', 'a', 0x10u, 0x00u, 0x10u, 0x00u,
+                                     0xFFu, 0xFFu, 0xFFu, 0x2Cu, 0x00u, 0x00u, 0x00u, 0x00u, 0xFFu, 0xFFu };
+    const uint8_t webpTrunc[12] = { 'R', 'I', 'F', 'F', 0x10u, 0x00u, 0x00u, 0x00u, 'W', 'E', 'B', 'P' };
+    const uint8_t webpGarbage[28] = { 'R', 'I', 'F', 'F', 0x14u, 0x00u, 0x00u, 0x00u, 'W', 'E', 'B', 'P',
+                                      'V', 'P', '8', ' ', 0x08u, 0x00u, 0x00u, 0x00u,
+                                      0xDEu, 0xADu, 0xBEu, 0xEFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu };
+    const uint8_t tiffTrunc[8] = { 'I', 'I', 42u, 0u, 8u, 0u, 0u, 0u };
+    const uint8_t tiffGarbage[20] = { 'M', 'M', 0u, 42u, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
+                                      0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu, 0xFFu, 0x00u, 0x11u,
+                                      0x22u, 0x33u, 0x44u, 0x55u };
+    const uint8_t bmpTrunc[2] = { 'B', 'M' };
+    const uint8_t bmpGarbage[60] = { 'B', 'M', 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0u, 0u, 0u, 0u, 0xFFu, 0xFFu, 0xFFu, 0xFFu,
+                                     0x28u, 0u, 0u, 0u, 0xFFu, 0xFFu, 0xFFu, 0x7Fu, 0xFFu, 0xFFu, 0xFFu, 0x7Fu };
+
+    XSCData *badPayloads[30] = {
+        [XSCData emptyData],
+        [XSCData dataWithBytes:oneByte length:sizeof(oneByte)],
+        [XSCData dataWithBytes:garbage length:sizeof(garbage)],
+        [XSCData dataWithBytes:jpgTruncHdr length:sizeof(jpgTruncHdr)],
+        [XSCData dataWithBytes:validJpg.bytes length:validJpg.length / 2u],
+        [XSCData dataWithBytes:jpgGarbage length:sizeof(jpgGarbage)],
+        makeHugeDimensionJPEG(65535u, 65535u),
+        [XSCData dataWithBytes:pngTruncSig length:sizeof(pngTruncSig)],
+        [XSCData dataWithBytes:validPng.bytes length:validPng.length / 2u],
+        [XSCData dataWithBytes:pngGarbage length:sizeof(pngGarbage)],
+        makeHugeDimensionPNG(100000u, 100000u, 6u),
+        makeHugeDimensionPNG(100000u, 100000u, 0u),
+        [XSCData dataWithBytes:gifTruncHdr length:sizeof(gifTruncHdr)],
+        [XSCData dataWithBytes:validGif.bytes length:validGif.length / 2u],
+        [XSCData dataWithBytes:gifGarbage length:sizeof(gifGarbage)],
+        makeHugeDimensionGIF(65535u, 65535u, 16u, 16u),
+        makeHugeDimensionGIF(16u, 16u, 65535u, 65535u),
+        [XSCData dataWithBytes:webpTrunc length:sizeof(webpTrunc)],
+        [XSCData dataWithBytes:webpGarbage length:sizeof(webpGarbage)],
+        [XSCData dataWithBytes:tiffTrunc length:sizeof(tiffTrunc)],
+        [XSCData dataWithBytes:tiffGarbage length:sizeof(tiffGarbage)],
+        makeHugeDimensionTIFF(100000u, 100000u),
+        [XSCData dataWithBytes:bmpTrunc length:sizeof(bmpTrunc)],
+        [XSCData dataWithBytes:bmpGarbage length:sizeof(bmpGarbage)],
+        makeHugeDimensionBMP(100000, 100000, 24u, 54u),
+        makeHugeDimensionBMP(16, INT32_MIN, 32u, 54u),
+        makeMalformedISOBMFF("avif", false),
+        makeMalformedISOBMFF("avif", true),
+        makeMalformedISOBMFF("heic", false),
+        makeMalformedISOBMFF("heic", true),
+    };
+    const char *badNames[30] = {
+        "01_empty.png", "02_onebyte.jpg", "03_garbage.png",
+        "04_jpg_trunc_hdr.jpg", "05_jpg_trunc_mid.jpg", "06_jpg_garbage.jpg", "07_jpg_huge.jpg",
+        "08_png_trunc_sig.png", "09_png_trunc_mid.png", "10_png_garbage.png", "11_png_huge_rgba.png", "12_png_huge_gray.png",
+        "13_gif_trunc_hdr.gif", "14_gif_trunc_mid.gif", "15_gif_garbage.gif", "16_gif_huge_scr.gif", "17_gif_huge_frm.gif",
+        "18_webp_trunc.webp", "19_webp_garbage.webp",
+        "20_tiff_trunc.tiff", "21_tiff_garbage.tiff", "22_tiff_huge.tiff",
+        "23_bmp_trunc.bmp", "24_bmp_garbage.bmp", "25_bmp_huge.bmp", "26_bmp_int32min.bmp",
+        "27_avif_trunc.avif", "28_avif_huge.avif",
+        "29_heif_trunc.heic", "30_heif_huge.heic",
+    };
+
+    TestZipEntry badEntries[30];
+    for (size_t i = 0u; i < 30u; i++) {
+        badEntries[i] = (TestZipEntry){ badNames[i], badPayloads[i], false, false, 0ULL };
+    }
+    XSCString *badCbz = [tmpDir stringByAppendingPathComponent:"adversarial_codecs.cbz"];
+    XSC_ASSERT(writeTestZIP(badCbz.utf8, badEntries, 30u, false), "write adversarial_codecs.cbz");
+
+    XSCBook *badBook = nil;
+    handle { badBook = tryValue([XSCBook openPath:badCbz.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    XSC_ASSERT(badBook != nil && badBook.pageCount == 30u, "open adversarial_codecs.cbz (30 payloads)");
+
+    if (badBook) {
+        // Small maxEntryCount=8 exercises bounded negative-cache eviction across 30 failures.
+        XSCImageStore *store = [[XSCImageStore alloc] initWithMaxEntryCount:8u maxByteBudget:8u * 1024u * 1024u];
+        defer { [store shutdown]; }
+
+        __block size_t completed = 0u;
+        __block size_t cleanFailures = 0u;
+        __block bool allOnMain = true;
+        for (size_t i = 0u; i < 30u; i++) {
+            [store requestPageForBook:badBook index:i priority:true
+                           completion:^(XSCOptDecodedPage pOpt, bool failed) {
+                if (!xsc_is_main_thread()) allOnMain = false;
+                bool isNone = match(pOpt) {
+                    case .Some(let p) => (p == nil);
+                    case .None => true;
+                };
+                if (failed && isNone) cleanFailures++;
+                completed++;
+            }];
+        }
+        pumpMainUntil(^bool { return completed >= 30u; }, 10000.0);
+        XSC_ASSERT(completed == 30u && cleanFailures == 30u && allOnMain,
+                   "all 30 malformed codec payloads failed cleanly on main (completed=%zu, clean=%zu)",
+                   completed, cleanFailures);
+        XSC_ASSERT(store.currentEntryCount == 0u && store.currentByteCount == 0u,
+                   "failed decodes do not pollute positive cache (entries=%zu, bytes=%zu)",
+                   store.currentEntryCount, store.currentByteCount);
+
+        // Verify negative-cache hit on repeated requests (still in bounded failed set)
+        __block size_t negCompleted = 0u;
+        __block size_t negFailed = 0u;
+        for (size_t i = 26u; i < 30u; i++) {
+            XSCOptDecodedPage cached = [store cachedPageForBook:badBook index:i];
+            bool cachedNone = match(cached) { case .Some(let p) => (p == nil); case .None => true; };
+            XSC_ASSERT(cachedNone, "failed page %zu is not in positive cache", i);
+            [store requestPageForBook:badBook index:i priority:true
+                           completion:^(XSCOptDecodedPage pOpt, bool failed) {
+                bool isNone = match(pOpt) { case .Some(let p) => (p == nil); case .None => true; };
+                if (failed && isNone) negFailed++;
+                negCompleted++;
+            }];
+        }
+        pumpMainUntil(^bool { return negCompleted >= 4u; }, 2000.0);
+        XSC_ASSERT(negCompleted == 4u && negFailed == 4u, "negative-cache repeat requests fail cleanly");
+
+        // Verify resetKeepingBook:None clears negative cache and allows clean re-attempt
+        [store resetKeepingBook:None(XSCBook *)];
+        __block bool retryDone = false;
+        __block bool retryFailed = false;
+        [store requestPageForBook:badBook index:29u priority:true
+                       completion:^(XSCOptDecodedPage pOpt, bool failed) {
+            (void)pOpt;
+            retryFailed = failed;
+            retryDone = true;
+        }];
+        pumpMainUntil(^bool { return retryDone; }, 3000.0);
+        XSC_ASSERT(retryDone && retryFailed, "post-reset decode re-runs and fails cleanly");
+    }
+}
+
+#pragma mark - Test 9: Hostile Archives (ZIP/Zip64/TAR/7z/Traversal/NUL/Empty/Missing)
+
+static void testHostileArchives(XSCString *tmpDir, XSCData *png1) {
+    printf("[TEST] Hostile Archives (Truncated ZIP, Corrupt Zip64, Invalid TAR, Corrupt 7z, Paths)\n");
+
+    // 1. Missing file & unsupported extensions
+    XSCString *missingPath = [tmpDir stringByAppendingPathComponent:"does_not_exist.cbz"];
+    XSC_ASSERT(openExpectErrorCode(missingPath.utf8) == XSCArchiveErrorMissingFile,
+               "missing archive returns XSCArchiveErrorMissingFile");
+    XSC_ASSERT(openExpectErrorCode("") == XSCArchiveErrorMissingFile,
+               "empty path returns XSCArchiveErrorMissingFile");
+
+    XSCString *pdfPath = [tmpDir stringByAppendingPathComponent:"book.pdf"];
+    writeFileBytes(pdfPath.utf8, "%PDF-1.7", 8u);
+    XSC_ASSERT(openExpectErrorCode(pdfPath.utf8) == XSCArchiveErrorUnsupportedFormat,
+               ".pdf returns XSCArchiveErrorUnsupportedFormat");
+
+    XSCString *noExtPath = [tmpDir stringByAppendingPathComponent:"noextension"];
+    writeFileBytes(noExtPath.utf8, "hello", 5u);
+    XSC_ASSERT(openExpectErrorCode(noExtPath.utf8) == XSCArchiveErrorUnsupportedFormat,
+               "extensionless file returns XSCArchiveErrorUnsupportedFormat");
+
+    // 2. Empty archives -> XSCArchiveErrorNoImages
+    XSCString *emptyZip = [tmpDir stringByAppendingPathComponent:"empty_0.cbz"];
+    uint8_t emptyEocd[22] = { 0x50u, 0x4Bu, 0x05u, 0x06u };
+    writeFileBytes(emptyZip.utf8, emptyEocd, sizeof(emptyEocd));
+    XSC_ASSERT(openExpectErrorCode(emptyZip.utf8) == XSCArchiveErrorNoImages,
+               "0-entry ZIP returns XSCArchiveErrorNoImages");
+
+    XSCString *txtOnlyZip = [tmpDir stringByAppendingPathComponent:"txtonly.cbz"];
+    XSCData *txtData = [XSCData dataWithBytes:"readme" length:6u];
+    TestZipEntry txtEnt[] = { { "readme.txt", txtData, false, false, 0ULL } };
+    writeTestZIP(txtOnlyZip.utf8, txtEnt, 1u, false);
+    XSC_ASSERT(openExpectErrorCode(txtOnlyZip.utf8) == XSCArchiveErrorNoImages,
+               "text-only ZIP returns XSCArchiveErrorNoImages");
+
+    XSCString *emptyTar = [tmpDir stringByAppendingPathComponent:"empty.cbt"];
+    uint8_t zeroTar[1024];
+    memset(zeroTar, 0, sizeof(zeroTar));
+    writeFileBytes(emptyTar.utf8, zeroTar, sizeof(zeroTar));
+    XSC_ASSERT(openExpectErrorCode(emptyTar.utf8) == XSCArchiveErrorNoImages,
+               "empty TAR returns XSCArchiveErrorNoImages");
+
+    XSCString *emptyDir = [tmpDir stringByAppendingPathComponent:"empty_dir"];
+    makeDirs(emptyDir.utf8);
+    XSC_ASSERT(openExpectErrorCode(emptyDir.utf8) == XSCArchiveErrorNoImages,
+               "empty directory returns XSCArchiveErrorNoImages");
+
+    // 3. Hostile ZIP paths: embedded NUL, \..\evil.png, .//evil.png, ./C:/evil.png, /abs.png
+    const char nulName[] = { 'p', 'a', 'g', 'e', '\0', 'e', 'v', 'i', 'l', '.', 'p', 'n', 'g' };
+    XSCString *nulZip = [tmpDir stringByAppendingPathComponent:"nul_name.cbz"];
+    writeRawNameSingleEntryZIP(nulZip.utf8, nulName, sizeof(nulName), 0u,
+                               png1.bytes, png1.length, png1.length, NULL, 0u, false);
+    XSC_ASSERT(openExpectErrorCode(nulZip.utf8) == XSCArchiveErrorUnsafePath,
+               "ZIP entry with embedded NUL rejected with XSCArchiveErrorUnsafePath");
+
+    const char *unsafePaths[] = {
+        "\\..\\evil.png",
+        "sub\\..\\..\\evil.png",
+        ".//evil.png",
+        "./C:/evil.png",
+        "/etc/evil.png",
+        "C:\\evil.png",
+    };
+    for (size_t i = 0u; i < sizeof(unsafePaths) / sizeof(unsafePaths[0]); i++) {
+        XSCString *p = [tmpDir stringByAppendingPathComponent:
+                        [XSCString stringWithFormat:"unsafe_%zu.cbz", i].utf8];
+        writeRawNameSingleEntryZIP(p.utf8, unsafePaths[i], strlen(unsafePaths[i]), 0u,
+                                   png1.bytes, png1.length, png1.length, NULL, 0u, false);
+        XSC_ASSERT(openExpectErrorCode(p.utf8) == XSCArchiveErrorUnsafePath,
+                   "unsafe ZIP path '%s' rejected with XSCArchiveErrorUnsafePath", unsafePaths[i]);
+    }
+
+    // 4. Truncated ZIP EOCD & truncated Central Directory
+    XSCString *tinyZip = [tmpDir stringByAppendingPathComponent:"tiny_trunc.cbz"];
+    writeFileBytes(tinyZip.utf8, "PK\x03\x04\x14\x00\x00\x00\x00\x00", 10u);
+    XSC_ASSERT(openExpectErrorCode(tinyZip.utf8) == XSCArchiveErrorCorruptArchive,
+               "10-byte truncated ZIP rejected with XSCArchiveErrorCorruptArchive");
+
+    XSCString *goodZip = [tmpDir stringByAppendingPathComponent:"good_for_trunc.cbz"];
+    TestZipEntry goodEnt[] = { { "p1.png", png1, false, false, 0ULL } };
+    writeTestZIP(goodZip.utf8, goodEnt, 1u, false);
+    FILE *gf = fopen(goodZip.utf8, "rb");
+    XSC_ASSERT(gf != NULL, "read back good_for_trunc.cbz");
+    if (gf) {
+        defer { fclose(gf); }
+        fseek(gf, 0, SEEK_END);
+        long fsz = ftell(gf);
+        fseek(gf, 0, SEEK_SET);
+        if (fsz > 30) {
+            uint8_t *rawZip = (uint8_t *)malloc((size_t)fsz);
+            defer { free(rawZip); }
+            if (rawZip && fread(rawZip, 1u, (size_t)fsz, gf) == (size_t)fsz) {
+                // Truncate last 5 bytes (cutting off EOCD)
+                XSCString *truncEocd = [tmpDir stringByAppendingPathComponent:"trunc_eocd.cbz"];
+                writeFileBytes(truncEocd.utf8, rawZip, (size_t)fsz - 5u);
+                XSC_ASSERT(openExpectErrorCode(truncEocd.utf8) == XSCArchiveErrorCorruptArchive,
+                           "truncated ZIP EOCD rejected with XSCArchiveErrorCorruptArchive");
+
+                // Shrink cdSize in EOCD by 10 bytes (truncated Central Directory)
+                uint32_t origCdSize = (uint32_t)rawZip[fsz - 10] |
+                                      ((uint32_t)rawZip[fsz - 9] << 8) |
+                                      ((uint32_t)rawZip[fsz - 8] << 16) |
+                                      ((uint32_t)rawZip[fsz - 7] << 24);
+                if (origCdSize > 10u) {
+                    uint32_t badCdSize = origCdSize - 10u;
+                    rawZip[fsz - 10] = (uint8_t)(badCdSize & 0xFFu);
+                    rawZip[fsz - 9] = (uint8_t)((badCdSize >> 8) & 0xFFu);
+                    rawZip[fsz - 8] = (uint8_t)((badCdSize >> 16) & 0xFFu);
+                    rawZip[fsz - 7] = (uint8_t)((badCdSize >> 24) & 0xFFu);
+                    XSCString *truncCd = [tmpDir stringByAppendingPathComponent:"trunc_cd.cbz"];
+                    writeFileBytes(truncCd.utf8, rawZip, (size_t)fsz);
+                    XSC_ASSERT(openExpectErrorCode(truncCd.utf8) == XSCArchiveErrorCorruptArchive,
+                               "truncated ZIP central directory rejected with XSCArchiveErrorCorruptArchive");
+                }
+            }
+        }
+    }
+
+    // 5. Corrupt Zip64 extra field (truncated 4-byte 0x0001 extra field with 0xFFFFFFFF sentinel)
+    const uint8_t badZ64Extra[8] = { 0x01u, 0x00u, 0x04u, 0x00u, 0x11u, 0x22u, 0x33u, 0x44u };
+    XSCString *badZ64Zip = [tmpDir stringByAppendingPathComponent:"corrupt_z64_extra.cbz"];
+    writeRawNameSingleEntryZIP(badZ64Zip.utf8, "01.png", 6u, 0u,
+                               png1.bytes, png1.length, png1.length,
+                               badZ64Extra, sizeof(badZ64Extra), true);
+    XSC_ASSERT(openExpectErrorCode(badZ64Zip.utf8) == XSCArchiveErrorCorruptArchive,
+               "corrupt Zip64 extra field rejected with XSCArchiveErrorCorruptArchive");
+
+    // 6. Corrupt Zip64 EOCD Locator (bad Zip64 EOCD offset)
+    XSCByteBuf badZ64Loc = {0};
+    defer { xscBufFree(&badZ64Loc); }
+    xscBufAppendU32(&badZ64Loc, 0x07064b50u); // Zip64 EOCD Locator signature
+    xscBufAppendU32(&badZ64Loc, 0u);
+    xscBufAppendU64(&badZ64Loc, 999999ULL);   // OOB Zip64 EOCD offset
+    xscBufAppendU32(&badZ64Loc, 1u);
+    xscBufAppendU32(&badZ64Loc, 0x06054b50u); // Classic EOCD
+    xscBufAppendU16(&badZ64Loc, 0u); xscBufAppendU16(&badZ64Loc, 0u);
+    xscBufAppendU16(&badZ64Loc, 0xFFFFu); xscBufAppendU16(&badZ64Loc, 0xFFFFu);
+    xscBufAppendU32(&badZ64Loc, 0xFFFFFFFFu); xscBufAppendU32(&badZ64Loc, 0xFFFFFFFFu);
+    xscBufAppendU16(&badZ64Loc, 0u);
+    XSCString *badZ64LocPath = [tmpDir stringByAppendingPathComponent:"corrupt_z64_loc.cbz"];
+    writeFileBytes(badZ64LocPath.utf8, badZ64Loc.data, badZ64Loc.len);
+    XSC_ASSERT(openExpectErrorCode(badZ64LocPath.utf8) == XSCArchiveErrorCorruptArchive,
+               "corrupt Zip64 EOCD locator rejected with XSCArchiveErrorCorruptArchive");
+
+    // 7. Mismatched STORE compSize != uncompSize
+    XSCString *mismatchStore = [tmpDir stringByAppendingPathComponent:"mismatch_store.cbz"];
+    writeRawNameSingleEntryZIP(mismatchStore.utf8, "01.png", 6u, 0u,
+                               png1.bytes, png1.length, png1.length + 100u, NULL, 0u, false);
+    XSC_ASSERT(openExpectErrorCode(mismatchStore.utf8) == XSCArchiveErrorCorruptArchive,
+               "mismatched STORE entry sizes rejected with XSCArchiveErrorCorruptArchive");
+
+    // 8. Lying-header DEFLATE bomb (declares uncompressedSize=16, inflates 2048 bytes)
+    uint8_t bigZeros[2048];
+    memset(bigZeros, 'A', sizeof(bigZeros));
+    XSCData *bombDeflated = rawDeflateData(bigZeros, sizeof(bigZeros));
+    XSCString *lyingBomb = [tmpDir stringByAppendingPathComponent:"lying_deflate.cbz"];
+    writeRawNameSingleEntryZIP(lyingBomb.utf8, "01.png", 6u, 8u,
+                               bombDeflated.bytes, bombDeflated.length, 16u, NULL, 0u, false);
+    XSCBook *lyingBook = nil;
+    handle { lyingBook = tryValue([XSCBook openPath:lyingBomb.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    XSC_ASSERT(lyingBook != nil, "open lying_deflate.cbz");
+    if (lyingBook) {
+        int inflateErr = 0;
+        handle { (void)tryValue([lyingBook readPageDataAtIndex:0u]); } catch(XSCError *e) { inflateErr = e.code; }
+        XSC_ASSERT(inflateErr == XSCArchiveErrorCorruptArchive,
+                   "lying-header DEFLATE zip bomb caught on read (err=%d)", inflateErr);
+    }
+
+    // 9. Corrupt DEFLATE stream inside valid ZIP
+    const uint8_t badDeflate[16] = { 0xFFu, 0xFFu, 0xFFu, 0x00u, 0xDEu, 0xADu, 0xBEu, 0xEFu,
+                                     0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u };
+    XSCString *badDeflateZip = [tmpDir stringByAppendingPathComponent:"corrupt_deflate.cbz"];
+    writeRawNameSingleEntryZIP(badDeflateZip.utf8, "01.png", 6u, 8u,
+                               badDeflate, sizeof(badDeflate), 64u, NULL, 0u, false);
+    XSCBook *badDefBook = nil;
+    handle { badDefBook = tryValue([XSCBook openPath:badDeflateZip.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    if (badDefBook) {
+        int defErr = 0;
+        handle { (void)tryValue([badDefBook readPageDataAtIndex:0u]); } catch(XSCError *e) { defErr = e.code; }
+        XSC_ASSERT(defErr == XSCArchiveErrorCorruptArchive,
+                   "corrupt DEFLATE stream rejected cleanly on read (err=%d)", defErr);
+    }
+
+    // 10. Invalid TAR octal size (valid checksum, non-octal digit '9' in size field)
+    uint8_t tarBadOctal[1024];
+    memset(tarBadOctal, 0, sizeof(tarBadOctal));
+    memcpy(tarBadOctal, "page1.png", 9u);
+    memcpy(tarBadOctal + 100, "0000644\0", 8u);
+    memcpy(tarBadOctal + 124, "00000000099\0", 12u); // invalid octal '9'
+    tarBadOctal[156] = '0';
+    memcpy(tarBadOctal + 257, "ustar", 6u);
+    fillTarHeaderChecksum(tarBadOctal);
+    XSCString *tarOctPath = [tmpDir stringByAppendingPathComponent:"bad_octal.cbt"];
+    writeFileBytes(tarOctPath.utf8, tarBadOctal, sizeof(tarBadOctal));
+    XSC_ASSERT(openExpectErrorCode(tarOctPath.utf8) == XSCArchiveErrorCorruptArchive,
+               "TAR with invalid octal digit '9' rejected with XSCArchiveErrorCorruptArchive");
+
+    // 11. TAR with valid block 0 + invalid checksum on block 1
+    uint8_t tarBadBlk1[1536];
+    memset(tarBadBlk1, 0, sizeof(tarBadBlk1));
+    memcpy(tarBadBlk1, "page1.png", 9u);
+    memcpy(tarBadBlk1 + 100, "0000644\0", 8u);
+    memcpy(tarBadBlk1 + 124, "00000000000\0", 12u);
+    tarBadBlk1[156] = '0';
+    memcpy(tarBadBlk1 + 257, "ustar", 6u);
+    fillTarHeaderChecksum(tarBadBlk1);
+    // Block 1: non-zero header with bogus checksum
+    memcpy(tarBadBlk1 + 512, "page2.png", 9u);
+    memcpy(tarBadBlk1 + 512 + 148, "000001\0 ", 8u);
+    XSCString *tarChkPath = [tmpDir stringByAppendingPathComponent:"bad_blk1_chk.cbt"];
+    writeFileBytes(tarChkPath.utf8, tarBadBlk1, sizeof(tarBadBlk1));
+    XSC_ASSERT(openExpectErrorCode(tarChkPath.utf8) == XSCArchiveErrorCorruptArchive,
+               "TAR with corrupt block-1 header checksum rejected with XSCArchiveErrorCorruptArchive");
+
+    // 12. TAR with corrupt block 0 checksum (exercises libarchive fallback rejection)
+    uint8_t tarBadBlk0[1024];
+    memset(tarBadBlk0, 0xAB, sizeof(tarBadBlk0));
+    XSCString *tarBlk0Path = [tmpDir stringByAppendingPathComponent:"bad_blk0.cbt"];
+    writeFileBytes(tarBlk0Path.utf8, tarBadBlk0, sizeof(tarBadBlk0));
+    XSC_ASSERT(openExpectErrorCode(tarBlk0Path.utf8) == XSCArchiveErrorCorruptArchive,
+               "TAR with corrupt block-0 header rejected with XSCArchiveErrorCorruptArchive");
+
+    // 13. TAR with path traversal "../evil.png"
+    uint8_t tarTrav[1024];
+    memset(tarTrav, 0, sizeof(tarTrav));
+    memcpy(tarTrav, "../evil.png", 11u);
+    memcpy(tarTrav + 100, "0000644\0", 8u);
+    memcpy(tarTrav + 124, "00000000000\0", 12u);
+    tarTrav[156] = '0';
+    memcpy(tarTrav + 257, "ustar", 6u);
+    fillTarHeaderChecksum(tarTrav);
+    XSCString *tarTravPath = [tmpDir stringByAppendingPathComponent:"tar_trav.cbt"];
+    writeFileBytes(tarTravPath.utf8, tarTrav, sizeof(tarTrav));
+    XSC_ASSERT(openExpectErrorCode(tarTravPath.utf8) == XSCArchiveErrorUnsafePath,
+               "TAR path traversal rejected with XSCArchiveErrorUnsafePath");
+
+    // 14. Corrupt 7z header & garbage .cb7
+    const uint8_t corrupt7z[48] = {
+        '7', 'z', 0xBCu, 0xAFu, 0x27u, 0x1Cu, 0x00u, 0x04u,
+        0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xDEu, 0xADu, 0xBEu, 0xEFu,
+        0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u,
+        0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu, 0xFFu, 0x11u, 0x22u,
+        0x33u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u, 0x99u, 0x00u,
+        0xFFu, 0x00u, 0xFFu, 0x00u, 0x12u, 0x34u, 0x56u, 0x78u,
+    };
+    XSCString *corrupt7zPath = [tmpDir stringByAppendingPathComponent:"corrupt_hdr.cb7"];
+    writeFileBytes(corrupt7zPath.utf8, corrupt7z, sizeof(corrupt7z));
+    XSC_ASSERT(openExpectErrorCode(corrupt7zPath.utf8) == XSCArchiveErrorCorruptArchive,
+               "corrupt 7z header rejected with XSCArchiveErrorCorruptArchive");
+
+    XSCString *garbage7zPath = [tmpDir stringByAppendingPathComponent:"garbage.cb7"];
+    writeFileBytes(garbage7zPath.utf8, "NOT_A_7Z_ARCHIVE_AT_ALL_0123456789", 34u);
+    XSC_ASSERT(openExpectErrorCode(garbage7zPath.utf8) == XSCArchiveErrorCorruptArchive,
+               "garbage .cb7 rejected with XSCArchiveErrorCorruptArchive");
+}
+
+#pragma mark - Test 10: Concurrency, Tiny Budget & Cancellation Churn Stress
+
+typedef struct ConcurrentReadCtx {
+    __unsafe_unretained XSCBook *book;
+    __unsafe_unretained XSCData *const *expected;
+    size_t pageCount;
+    size_t threadId;
+    size_t iterations;
+    _Atomic(size_t) *okCount;
+    _Atomic(size_t) *failCount;
+} ConcurrentReadCtx;
+
+static void *concurrentBookReaderWorker(void *arg) {
+    ConcurrentReadCtx *ctx = (ConcurrentReadCtx *)arg;
+    @autoreleasepool {
+        for (size_t iter = 0u; iter < ctx->iterations; iter++) {
+            size_t idx = (iter * 3u + ctx->threadId) % ctx->pageCount;
+            XSCData *got = nil;
+            handle {
+                got = tryValue([ctx->book readPageDataAtIndex:idx]);
+            } catch(XSCError *e) {
+                (void)e;
+                got = nil;
+            }
+            if (got && [got isEqualToData:ctx->expected[idx]]) {
+                atomic_fetch_add_explicit(ctx->okCount, 1u, memory_order_relaxed);
+            } else {
+                atomic_fetch_add_explicit(ctx->failCount, 1u, memory_order_relaxed);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void run4ThreadBookReadStress(const char *label,
+                                     XSCBook *book,
+                                     XSCData *const *expected,
+                                     size_t pageCount) {
+    XSC_ASSERT(book != nil && book.pageCount == pageCount, "%s book opened for 4-thread stress", label);
+    if (!book || book.pageCount != pageCount) return;
+
+    _Atomic(size_t) okCount = 0u;
+    _Atomic(size_t) failCount = 0u;
+    pthread_t threads[4];
+    ConcurrentReadCtx ctxs[4];
+    const size_t itersPerThread = 32u;
+
+    for (size_t t = 0u; t < 4u; t++) {
+        ctxs[t] = (ConcurrentReadCtx){
+            book, expected, pageCount, t, itersPerThread, &okCount, &failCount
+        };
+        int rc = pthread_create(&threads[t], NULL, concurrentBookReaderWorker, &ctxs[t]);
+        XSC_ASSERT(rc == 0, "%s spawned reader thread %zu", label, t);
+    }
+    for (size_t t = 0u; t < 4u; t++) {
+        pthread_join(threads[t], NULL);
+    }
+    size_t ok = atomic_load_explicit(&okCount, memory_order_acquire);
+    size_t fail = atomic_load_explicit(&failCount, memory_order_acquire);
+    XSC_ASSERT(ok == 4u * itersPerThread && fail == 0u,
+               "%s 4-thread concurrent reads (%zu/%zu ok, %zu fail)",
+               label, ok, 4u * itersPerThread, fail);
+}
+
+static void testConcurrencyAndStress(XSCString *tmpDir, XSCData *png1, XSCData *png2) {
+    printf("[TEST] Concurrency Stress (4-Thread Book Reads, 4-Lane Store, 2-Entry/256KiB Budget, Model Churn)\n");
+
+    XSCData *jpgColor = makeSyntheticJPEG(96u, 96u, false, 0u);
+    XSCData *gifAnim = makeAnimatedGIFData(48u, 48u);
+    XSCData *expected4[4] = { png1, png2, jpgColor, gifAnim };
+
+    // A. 4-thread concurrent readPageDataAtIndex: across ALL 4 backends (ZIP, TAR, Directory, 7z)
+    XSCString *concZipPath = [tmpDir stringByAppendingPathComponent:"conc_4t.cbz"];
+    TestZipEntry concZipEnts[4] = {
+        { "01.png", png1, false, false, 0ULL },
+        { "02.png", png2, true, false, 0ULL },
+        { "03.jpg", jpgColor, true, false, 0ULL },
+        { "04.gif", gifAnim, false, false, 0ULL },
+    };
+    writeTestZIP(concZipPath.utf8, concZipEnts, 4u, false);
+    XSCBook *concZip = nil;
+    handle { concZip = tryValue([XSCBook openPath:concZipPath.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    run4ThreadBookReadStress("ZIP", concZip, expected4, 4u);
+
+    TestArchiveEntry concArchEnts[4] = {
+        { "01.png", png1 },
+        { "02.png", png2 },
+        { "03.jpg", jpgColor },
+        { "04.gif", gifAnim },
+    };
+    XSCString *concTarPath = [tmpDir stringByAppendingPathComponent:"conc_4t.cbt"];
+    writeTestLibarchive(concTarPath.utf8, TestArchiveFormatUstar, concArchEnts, 4u);
+    XSCBook *concTar = nil;
+    handle { concTar = tryValue([XSCBook openPath:concTarPath.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    run4ThreadBookReadStress("TAR", concTar, expected4, 4u);
+
+    XSCString *conc7zPath = [tmpDir stringByAppendingPathComponent:"conc_4t.cb7"];
+    writeTestLibarchive(conc7zPath.utf8, TestArchiveFormat7zip, concArchEnts, 4u);
+    XSCBook *conc7z = nil;
+    handle { conc7z = tryValue([XSCBook openPath:conc7zPath.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    run4ThreadBookReadStress("7z", conc7z, expected4, 4u);
+
+    XSCString *concDirPath = [tmpDir stringByAppendingPathComponent:"conc_4t_dir"];
+    makeDirs(concDirPath.utf8);
+    writeDataToFile([concDirPath stringByAppendingPathComponent:"01.png"].utf8, png1);
+    writeDataToFile([concDirPath stringByAppendingPathComponent:"02.png"].utf8, png2);
+    writeDataToFile([concDirPath stringByAppendingPathComponent:"03.jpg"].utf8, jpgColor);
+    writeDataToFile([concDirPath stringByAppendingPathComponent:"04.gif"].utf8, gifAnim);
+    XSCBook *concDir = nil;
+    handle { concDir = tryValue([XSCBook openPath:concDirPath.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    run4ThreadBookReadStress("Directory", concDir, expected4, 4u);
+
+    // B. 4-lane XSCImageStore concurrent decode + prefetch promotion + coalescing + resetKeepingBook: churn
+    XSCString *laneCbz = [tmpDir stringByAppendingPathComponent:"lane_stress.cbz"];
+    XSCData *corruptPng = [XSCData dataWithBytes:"\x89PNG\r\n\x1a\nBAD" length:11u];
+    TestZipEntry laneEnts[16];
+    char laneNames[16][16];
+    for (size_t i = 0u; i < 16u; i++) {
+        snprintf(laneNames[i], sizeof(laneNames[i]), "p%02zu.png", i + 1u);
+        XSCData *p = (i == 7u || i == 13u) ? corruptPng : ((i & 1u) ? png2 : png1);
+        laneEnts[i] = (TestZipEntry){ laneNames[i], p, (i % 3u) == 0u, false, 0ULL };
+    }
+    writeTestZIP(laneCbz.utf8, laneEnts, 16u, false);
+    XSCBook *laneBook1 = nil;
+    XSCBook *laneBook2 = nil;
+    handle { laneBook1 = tryValue([XSCBook openPath:laneCbz.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+    handle { laneBook2 = tryValue([XSCBook openPath:concZipPath.utf8 cancelFlag:NULL]); } catch(XSCError *e) { (void)e; }
+
+    if (laneBook1 && laneBook2) {
+        XSCImageStore *store = [[XSCImageStore alloc] initWithMaxEntryCount:6u
+                                                              maxByteBudget:4u * 1024u * 1024u];
+        defer { [store shutdown]; }
+
+        // Fire background prefetch, immediately promote overlapping indices + duplicate coalesce + reset churn
+        size_t vis0[1] = { 0u };
+        size_t ord0[10] = { 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u };
+        [store updateRetentionAndPrefetchForBook:laneBook1
+                                  visibleIndices:[XSCIndexList listWithValues:vis0 count:1u]
+                                  orderedIndices:[XSCIndexList listWithValues:ord0 count:10u]];
+        [store prewarmPageForBook:laneBook2 index:0u];
+
+        __block size_t phase1Done = 0u;
+        __block bool phase1AllMain = true;
+        const size_t phase1Total = 16u;
+        for (size_t i = 0u; i < 8u; i++) {
+            for (int dup = 0; dup < 2; dup++) {
+                [store requestPageForBook:laneBook1 index:i priority:true
+                               completion:^(XSCOptDecodedPage pOpt, bool failed) {
+                    (void)pOpt; (void)failed;
+                    if (!xsc_is_main_thread()) phase1AllMain = false;
+                    phase1Done++;
+                }];
+            }
+        }
+        // Trigger mid-flight resetKeepingBook:Some(laneBook2) while laneBook1 jobs are still in flight!
+        [store resetKeepingBook:Some(XSCBook *, laneBook2)];
+
+        // Immediately request laneBook1 index 0 & laneBook2 index 1 AFTER reset (must NOT coalesce onto stale jobs!)
+        __block bool postB1Done = false, postB1Ok = false;
+        __block bool postB2Done = false, postB2Ok = false;
+        [store requestPageForBook:laneBook1 index:0u priority:true
+                       completion:^(XSCOptDecodedPage pOpt, bool failed) {
+            postB1Ok = !failed && match(pOpt) { case .Some(let p) => (p != nil); case .None => false; };
+            postB1Done = true;
+        }];
+        [store requestPageForBook:laneBook2 index:1u priority:true
+                       completion:^(XSCOptDecodedPage pOpt, bool failed) {
+            postB2Ok = !failed && match(pOpt) { case .Some(let p) => (p != nil); case .None => false; };
+            postB2Done = true;
+        }];
+
+        pumpMainUntil(^bool { return phase1Done >= phase1Total && postB1Done && postB2Done; }, 5000.0);
+        XSC_ASSERT(phase1Done == phase1Total && phase1AllMain,
+                   "all %zu pre-reset coalesced callbacks delivered on main (got %zu)", phase1Total, phase1Done);
+        XSC_ASSERT(postB1Done && postB1Ok && postB2Done && postB2Ok,
+                   "post-reset requests succeeded without colliding with stale pre-reset jobs");
+        XSC_ASSERT(store.currentEntryCount <= 6u && store.currentByteCount <= 4u * 1024u * 1024u,
+                   "4-lane store respects entry & byte caps (entries=%zu, bytes=%zu)",
+                   store.currentEntryCount, store.currentByteCount);
+    }
+
+    // C. Tiny 2-entry / 256 KiB budget + rapid forward/backward turning + oversized page + volatility
+    XSCData *tile128Color = makeSyntheticPNG(128u, 128u, false); // ~64 KiB RGBA8 decoded
+    XSCData *oversized512Color = makeSyntheticPNG(512u, 512u, false); // ~1 MiB RGBA8 > 256 KiB budget
+    XSCString *tinyBudgetCbz = [tmpDir stringByAppendingPathComponent:"tiny_budget.cbz"];
+    TestZipEntry budgetEnts[12];
+    char budgetNames[12][16];
+    for (size_t i = 0u; i < 12u; i++) {
+        snprintf(budgetNames[i], sizeof(budgetNames[i]), "b%02zu.png", i + 1u);
+        budgetEnts[i] = (TestZipEntry){ budgetNames[i], (i == 11u) ? oversized512Color : tile128Color, false, false, 0ULL };
+    }
+    writeTestZIP(tinyBudgetCbz.utf8, budgetEnts, 12u, false);
+
+    {
+        const size_t tinyByteCap = 256u * 1024u;
+        XSCImageStore *tinyStore = [[XSCImageStore alloc] initWithMaxEntryCount:2u maxByteBudget:tinyByteCap];
+        defer { [tinyStore shutdown]; }
+        XSCReaderModel *model = [[XSCReaderModel alloc] initWithImageStore:tinyStore];
+        TestReaderDelegate *del = [[TestReaderDelegate alloc] init];
+        model.delegate = del;
+
+        [model openPath:tinyBudgetCbz.utf8];
+        pumpMainUntil(^bool { return !model.isLoading && del.lastLeft != nil; }, 3000.0);
+        XSC_ASSERT(tinyStore.currentEntryCount <= 2u && tinyStore.currentByteCount <= tinyByteCap,
+                   "initial tiny budget invariant holds (entries=%zu, bytes=%zu)",
+                   tinyStore.currentEntryCount, tinyStore.currentByteCount);
+
+        // Rapid forward turns across pages 0..8
+        for (int step = 0; step < 8; step++) {
+            [model goForwardContinueAcrossVolumes:false];
+            xsc_main_drain();
+        }
+        // Rapid backward turns (triggers 2-turn backward predictor)
+        for (int step = 0; step < 4; step++) {
+            [model goBackwardContinueAcrossVolumes:false];
+            xsc_main_drain();
+        }
+        XSC_ASSERT(model.consecutiveBackwardTurns == 2u,
+                   "rapid backward turning saturates consecutiveBackwardTurns to 2 (got %u)",
+                   model.consecutiveBackwardTurns);
+
+        // Toggle double-page & RTL/LTR under tiny budget
+        [model togglePageMode];
+        [model toggleDirection];
+        [model goForwardContinueAcrossVolumes:false];
+        [model goBackwardContinueAcrossVolumes:false];
+        [model togglePageMode];
+        [model toggleDirection];
+
+        // Jump to oversized page 12 (1 MiB > 256 KiB budget): must deliver cleanly without exceeding cache budget
+        del.lastLeft = nil;
+        XSC_ASSERT([model jumpToOneBasedPageNumber:12], "jump to oversized page 12 succeeds");
+        pumpMainUntil(^bool { return del.lastLeft != nil && del.lastLeft.pixelWidth == 512u; }, 3000.0);
+        XSC_ASSERT(del.lastLeft != nil && del.lastLeft.pixelWidth == 512u && del.lastLeft.pixelHeight == 512u,
+                   "oversized page (> budget) delivered cleanly to delegate");
+        XSC_ASSERT(tinyStore.currentEntryCount <= 2u && tinyStore.currentByteCount <= tinyByteCap,
+                   "tiny budget strictly enforced after rapid turns + oversized page (entries=%zu, bytes=%zu)",
+                   tinyStore.currentEntryCount, tinyStore.currentByteCount);
+
+        // Lower the page's eviction priority and verify the cached pixels remain intact.
+        XSCBook *b = match(model.book) { case .Some(let bk) => bk; case .None => (XSCBook *)nil; };
+        if (b) {
+            __block bool w0 = false;
+            [tinyStore requestPageForBook:b index:0u priority:true completion:^(XSCOptDecodedPage p, bool f) {
+                (void)p; (void)f; w0 = true;
+            }];
+            pumpMainUntil(^bool { return w0; }, 3000.0);
+            size_t visOther[1] = { 1u };
+            [tinyStore updateRetentionAndPrefetchForBook:b
+                                          visibleIndices:[XSCIndexList listWithValues:visOther count:1u]
+                                          orderedIndices:[XSCIndexList emptyList]];
+            XSCOptDecodedPage retainedPage = [tinyStore cachedPageForBook:b index:0u];
+            bool retainedPixelsOK = match(retainedPage) {
+                case .Some(let p) => (p != nil && p.pixels != NULL && p.pixelWidth == 128u && p.pixels[3] == 255u);
+                case .None => false;
+            };
+            XSC_ASSERT(retainedPixelsOK, "cached page retains intact pixels after its eviction priority changes");
+        }
+    }
+
+    // D. XSCReaderModel rapid openPath: replacement + cancellation churn + mid-flight dealloc
+    XSCString *churn1 = [tmpDir stringByAppendingPathComponent:"churn1.cbz"];
+    XSCString *churn2 = [tmpDir stringByAppendingPathComponent:"churn2.cbz"];
+    XSCString *churn3 = [tmpDir stringByAppendingPathComponent:"churn3.cbz"];
+    XSCString *churnMissing = [tmpDir stringByAppendingPathComponent:"churn_missing.cbz"];
+    TestZipEntry cEnts[8];
+    char cNames[8][16];
+    for (size_t i = 0u; i < 8u; i++) {
+        snprintf(cNames[i], sizeof(cNames[i]), "c%02zu.png", i + 1u);
+        cEnts[i] = (TestZipEntry){ cNames[i], (i & 1u) ? png2 : png1, true, false, 0ULL };
+    }
+    writeTestZIP(churn1.utf8, cEnts, 4u, false);
+    writeTestZIP(churn2.utf8, cEnts, 6u, false);
+    writeTestZIP(churn3.utf8, cEnts, 8u, false);
+
+    {
+        XSCImageStore *churnStore = [[XSCImageStore alloc] initWithMaxEntryCount:8u maxByteBudget:16u * 1024u * 1024u];
+        defer { [churnStore shutdown]; }
+        XSCReaderModel *model = [[XSCReaderModel alloc] initWithImageStore:churnStore];
+        TestReaderDelegate *del = [[TestReaderDelegate alloc] init];
+        model.delegate = del;
+
+        const char *seqPaths[12] = {
+            churn1.utf8, churn2.utf8, churnMissing.utf8, churn3.utf8,
+            churn1.utf8, churnMissing.utf8, churn2.utf8, churn1.utf8,
+            churn3.utf8, churn2.utf8, churnMissing.utf8, churn3.utf8,
+        };
+        for (int i = 0; i < 12; i++) {
+            [model openPath:seqPaths[i] startAtEnd:(i == 11)];
+            if (i == 3 || i == 7) {
+                [model goForwardContinueAcrossVolumes:false];
+                [model toggleDirection];
+                XSC_ASSERT(![model jumpToOneBasedPageNumber:1],
+                           "jumpToOneBasedPageNumber rejected while openPath is loading");
+            }
+        }
+        // Reset direction back to LTR if toggled twice (3 and 7 = even = LTR)
+        pumpMainUntil(^bool { return !model.isLoading && del.lastLeft != nil; }, 5000.0);
+
+        XSCBook *finalBook = match(model.book) { case .Some(let b) => b; case .None => (XSCBook *)nil; };
+        bool noErr = match(model.errorMessage) { case .Some(let s) => (s == nil); case .None => true; };
+        XSC_ASSERT(finalBook != nil && [finalBook.sourcePath isEqualToString:churn3],
+                   "rapid openPath churn settled on final book churn3.cbz");
+        XSC_ASSERT(finalBook != nil && finalBook.pageCount == 8u && model.currentIndex == 7u && noErr,
+                   "final book opened startAtEnd cleanly (pages=%zu, idx=%zu)",
+                   finalBook ? finalBook.pageCount : 0u, model.currentIndex);
+    }
+
+    // Ephemeral XSCReaderModel mid-flight dealloc during background openPath (tests __weak + CancelToken)
+    {
+        XSCImageStore *ephStore = [[XSCImageStore alloc] initWithMaxEntryCount:4u maxByteBudget:8u * 1024u * 1024u];
+        defer { [ephStore shutdown]; }
+        for (int i = 0; i < 4; i++) {
+            @autoreleasepool {
+                XSCReaderModel *ephemeral = [[XSCReaderModel alloc] initWithImageStore:ephStore];
+                [ephemeral openPath:(i & 1) ? churn3.utf8 : churn2.utf8];
+                ephemeral = nil;
+            }
+        }
+        // Drain any completed main callbacks (all must safely no-op on zeroed weakSelf)
+        double endMs = nowMilliseconds() + 80.0;
+        while (nowMilliseconds() < endMs) {
+            xsc_main_wait_ms(10u);
+        }
+        xsc_main_drain();
+        XSC_ASSERT(true, "ephemeral XSCReaderModel mid-flight dealloc survived without crash or race");
+    }
+}
+
+#pragma mark - Test 11: Benchmarks & Linux RSS Reporting
+
+static void runBenchmarks(XSCString *tmpDir) {
+    printf("\n[BENCHMARKS]\n");
+
+    // 1. 4,096-file directory scan
+    XSCString *dir4k = [tmpDir stringByAppendingPathComponent:"bench4k"];
+    makeDirs(dir4k.utf8);
+    const uint8_t tiny = 0u;
+    for (int i = 0; i < 4096; i++) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof(p), "%s/page_%04d.jpg", dir4k.utf8, i);
+        FILE *f = fopen(p, "wb");
+        if (f) {
+            fwrite(&tiny, 1u, 1u, f);
+            fclose(f);
+        }
+    }
+    double t0 = nowMilliseconds();
+    XSCBook *b4k = nil;
+    handle {
+        b4k = tryValue([XSCBook openPath:dir4k.utf8 cancelFlag:NULL]);
+    } catch(XSCError *e) {
+        (void)e;
+    }
+    double dt4k = nowMilliseconds() - t0;
+    printf("  4,096-file dir scan         : %6.2f ms (pages=%zu)\n",
+           dt4k, b4k ? b4k.pageCount : 0u);
+    XSC_ASSERT(b4k != nil && b4k.pageCount == 4096u, "4k dir scan found 4096 pages");
+
+    // 2. 128-page & 500-page CBZ open
+    XSCData *pageImg = makeSyntheticJPEG(1024u, 1536u, true, 0u);
+    const size_t counts[2] = { 128u, 500u };
+    for (size_t cIdx = 0u; cIdx < 2u; cIdx++) {
+        size_t nPages = counts[cIdx];
+        XSCString *cbzName = [XSCString stringWithFormat:"bench_%zu.cbz", nPages];
+        XSCString *p = [tmpDir stringByAppendingPathComponent:cbzName.utf8];
+
+        TestZipEntry *ents = (TestZipEntry *)calloc(nPages, sizeof(TestZipEntry));
+        char (*names)[24] = (char (*)[24])calloc(nPages, 24u);
+        defer { free(ents); }
+        defer { free(names); }
+
+        for (size_t i = 0u; i < nPages; i++) {
+            snprintf(names[i], 24u, "page_%04zu.jpg", i + 1u);
+            ents[i] = (TestZipEntry){ names[i], pageImg, false, false, 0ULL };
+        }
+        writeTestZIP(p.utf8, ents, nPages, false);
+
+        double ts = nowMilliseconds();
+        XSCBook *b = nil;
+        handle {
+            b = tryValue([XSCBook openPath:p.utf8 cancelFlag:NULL]);
+        } catch(XSCError *e) {
+            (void)e;
+        }
+        double dt = nowMilliseconds() - ts;
+        printf("  %3zu-page CBZ open           : %6.3f ms (pages=%zu)\n",
+               nPages, dt, b ? b.pageCount : 0u);
+        XSC_ASSERT(b != nil && b.pageCount == nPages, "%zu-page CBZ opened", nPages);
+
+        if (nPages == 128u && b != nil) {
+            // 3. Cold decode & synchronous cache-hit lookup
+            XSCImageStore *store = [[XSCImageStore alloc] init];
+            defer { [store shutdown]; }
+            __block bool done = false;
+            __block XSCDecodedPage *decoded = nil;
+            double td0 = nowMilliseconds();
+            [store requestPageForBook:b index:0u priority:true
+                           completion:^(XSCOptDecodedPage pageOpt, bool failed) {
+                (void)failed;
+                decoded = match(pageOpt) {
+                    case .Some(let page) => page;
+                    case .None => (XSCDecodedPage *)nil;
+                };
+                done = true;
+            }];
+            pumpMainUntil(^bool { return done; }, 5000.0);
+            double td = nowMilliseconds() - td0;
+            printf("  Cold decode (1024x1536 JPEG): %6.2f ms\n", td);
+            XSC_ASSERT(decoded != nil && decoded.pixelWidth == 1024u && decoded.pixelHeight == 1536u,
+                       "cold 1024x1536 JPEG decoded cleanly");
+
+            const int iters = 10000;
+            double th0 = nowMilliseconds();
+            size_t hits = 0u;
+            for (int k = 0; k < iters; k++) {
+                XSCOptDecodedPage hitOpt = [store cachedPageForBook:b index:0u];
+                bool isHit = match(hitOpt) {
+                    case .Some(let page) => (page != nil);
+                    case .None => false;
+                };
+                if (isHit) hits++;
+            }
+            double thNs = (nowMilliseconds() - th0) * 1e6 / (double)iters;
+            printf("  Sync cache-hit lookup       : %6.1f ns/call (%zu/%d hits)\n",
+                   thNs, hits, iters);
+            XSC_ASSERT(hits == (size_t)iters, "all sync cache-hit lookups succeeded");
+        }
+    }
+
+    uint64_t rss = currentRssBytes();
+    printf("  Process resident memory     : %.2f MiB (%llu bytes)\n",
+           (double)rss / (1024.0 * 1024.0), (unsigned long long)rss);
+    XSC_ASSERT(rss > 0ULL, "process resident memory readable");
+}
+
+int main(void) {
+    xsc_mark_main_thread();
+    defer { xsc_dispatch_bg_shutdown(); }
+
+    @autoreleasepool {
+        char tmpl[] = "/tmp/xscomic-tests.XXXXXX";
+        char *dirC = mkdtemp(tmpl);
+        if (!dirC) {
+            perror("mkdtemp");
+            return 1;
+        }
+        defer { xsc_remove_tree(dirC); }
+        XSCString *tmpDir = [XSCString stringWithUTF8:dirC];
+
+        XSCData *png1 = makeSyntheticPNG(64u, 64u, true);
+        XSCData *png2 = makeSyntheticPNG(64u, 64u, false);
+        XSC_ASSERT(png1.length > 0u && png2.length > 0u, "synthetic PNG generators produced valid bytes");
+
+        testObjectiveC3Semantics();
+        testExtensionsAndNaturalSort();
+        testCBZStoreDeflateZip64Security(tmpDir, png1, png2);
+        testCBTAndCB7(tmpDir, png1, png2);
+        testDirectoryAndAdjacentVolumes(tmpDir, png1, png2);
+        testReaderModelAndPredictor(tmpDir, png1);
+        testImageStoreCachePurgeableGrayGIFExif(tmpDir);
+        testAdversarialCodecsAndNegativeCache(tmpDir, png1);
+        testHostileArchives(tmpDir, png1);
+        testConcurrencyAndStress(tmpDir, png1, png2);
+        runBenchmarks(tmpDir);
+
+        printf("\n=== SUMMARY: %d passed, %d failed ===\n", gPassCount, gFailCount);
+        return gFailCount == 0 ? 0 : 1;
+    }
+}

@@ -1,0 +1,115 @@
+name: macOS native app
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: GitHub-hosted Apple Silicon image
+        type: choice
+        options:
+          - macos-15
+          - macos-26
+        default: macos-15
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xscomic-macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: macOS arm64 app and core
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record and verify the native toolchain
+        id: preflight
+        shell: bash
+        run: |
+          mkdir -p build/ci
+          {
+            git rev-parse HEAD
+            uname -m
+            sw_vers
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun clang --version
+          } 2>&1 | tee build/ci/toolchain.log
+          if [[ $(uname -m) != arm64 ]]; then
+            echo '::error::AppKit qualification requires a native arm64 runner.'
+            exit 1
+          fi
+      - name: Build both app bundles and run core tests in parallel
+        shell: bash
+        run: |
+          mkdir -p build/ci
+          verify_bundle() {
+            local app="$1" arch resource
+            plutil -lint "$app/Contents/Info.plist" || return 1
+            arch=$(xcrun lipo -archs "$app/Contents/MacOS/ComicBookReader") || return 1
+            if [[ $arch != arm64 ]]; then
+              printf 'Expected an arm64 executable in %s, found %s\n' "$app" "$arch" >&2
+              return 1
+            fi
+            for resource in Assets.car AppIcon-Azusa.svg; do
+              if [[ ! -s "$app/Contents/Resources/$resource" ]]; then
+                printf 'Missing or empty bundle resource %s in %s\n' "$resource" "$app" >&2
+                return 1
+              fi
+            done
+            codesign --verify --deep --strict "$app"
+          }
+
+          (
+            ./scripts/build-app.sh &&
+            ditto -c -k --keepParent build/product/xsComic.app build/ci/xsComic-macos-arm64.zip &&
+            ditto -x -k build/ci/xsComic-macos-arm64.zip build/ci/unpacked &&
+            verify_bundle build/ci/unpacked/xsComic.app
+          ) > build/ci/release.log 2>&1 &
+          release=$!
+          (
+            CBR_SCRATCH_PATH="$PWD/build/clang-debug" CBR_OUTPUT_DIR="$PWD/build/product-debug" \
+              ./scripts/build-app.sh --debug &&
+            verify_bundle build/product-debug/xsComic.app
+          ) > build/ci/debug.log 2>&1 &
+          debug=$!
+          ./scripts/run-tests.sh > build/ci/core.log 2>&1 &
+          core=$!
+
+          failed=0
+          report() {
+            local name="$1" pid="$2" result=0
+            wait "$pid" || result=$?
+            printf '::group::%s (exit %s)\n' "$name" "$result"
+            cat "build/ci/$name.log"
+            printf '::endgroup::\n'
+            if (( result != 0 )); then
+              printf '::error title=macOS %s::Exited with status %s\n' "$name" "$result"
+              failed=1
+            fi
+          }
+          report release "$release"
+          report debug "$debug"
+          report core "$core"
+          exit "$failed"
+        id: qualify
+      - name: Preserve check logs
+        if: ${{ !cancelled() && (steps.preflight.outcome == 'success' || steps.preflight.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-logs
+          path: build/ci/*.log
+          if-no-files-found: error
+      - name: Preserve the verified release bundle
+        if: ${{ !cancelled() && steps.qualify.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsComic-macos-arm64
+          path: build/ci/xsComic-macos-arm64.zip
+          if-no-files-found: error

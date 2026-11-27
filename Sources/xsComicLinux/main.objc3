@@ -1,0 +1,3015 @@
+/*
+ main.objc3 — Native Linux SDL2 + OpenGL 3.3 Core desktop shell for xsComic.
+
+ Architecture:
+   - Single-process, minimal-dependency Linux desktop UI built on SDL2,
+     OpenGL 3.3 Core, SDL2_ttf (DejaVu Sans), and libpng.
+   - Reactive zero-busy-wait event loop: background archive open / image decode
+     completions push a registered SDL user event via xsc_set_main_wakeup() so
+     SDL_WaitEventTimeout() wakes instantaneously and drains xsc_main_drain().
+   - Analytical SDF rounded-rectangle + cached TTF glyph OpenGL 3.3 chrome
+     renderer delivering a modern dark studio UI with toolbar, collapsible page
+     sidebar, empty-state CTA, page-jump modal, settings popover, loading/error
+     overlays, and deterministic CLI / --screenshot PNG capture.
+ */
+
+#include "XSCArchive.h"
+#include "XSCBase.h"
+#include "XSCGLCanvas.h"
+#include "XSCImageStore.h"
+#include "XSCReaderModel.h"
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
+#include <SDL2/SDL_ttf.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <locale.h>
+#include <math.h>
+#include <png.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#pragma mark - Constants & Theme Palette
+
+static const int kXSCDefaultWindowW = 1280;
+static const int kXSCDefaultWindowH = 800;
+static const int kXSCMinWindowW = 640;
+static const int kXSCMinWindowH = 480;
+
+static const float kXSCToolbarHeight = 44.0f;
+static const float kXSCSidebarWidth = 180.0f;
+static const float kXSCSidebarHeaderH = 30.0f;
+static const float kXSCSidebarRowH = 42.0f;
+
+typedef struct XSCColor {
+    float r, g, b, a;
+} XSCColor;
+
+static inline XSCColor xsc_rgba(uint8_t r, uint8_t g, uint8_t b, float a) {
+    return (XSCColor){ (float)r / 255.0f, (float)g / 255.0f, (float)b / 255.0f, a };
+}
+
+static inline XSCColor xsc_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return xsc_rgba(r, g, b, 1.0f);
+}
+
+static inline bool xsc_pt_in_rect(float px, float py, XSCRectF r) {
+    return px >= r.x && px < (r.x + r.width) && py >= r.y && py < (r.y + r.height);
+}
+
+// Dark studio theme tokens
+static const XSCColor kColCanvasBg       = { 20.0f / 255.0f,  21.0f / 255.0f,  24.0f / 255.0f, 1.0f }; // #141518
+static const XSCColor kColChromeBg       = { 29.0f / 255.0f,  31.0f / 255.0f,  36.0f / 255.0f, 1.0f }; // #1D1F24
+static const XSCColor kColCardBg         = { 27.0f / 255.0f,  29.0f / 255.0f,  35.0f / 255.0f, 1.0f }; // #1B1D23
+static const XSCColor kColTroughBg       = { 20.0f / 255.0f,  21.0f / 255.0f,  24.0f / 255.0f, 1.0f }; // #141518
+static const XSCColor kColBorder         = { 42.0f / 255.0f,  45.0f / 255.0f,  53.0f / 255.0f, 1.0f }; // #2A2D35
+static const XSCColor kColBorderStrong   = { 54.0f / 255.0f,  59.0f / 255.0f,  71.0f / 255.0f, 1.0f }; // #363B47
+static const XSCColor kColBtnFill        = { 37.0f / 255.0f,  40.0f / 255.0f,  48.0f / 255.0f, 1.0f }; // #252830
+static const XSCColor kColHoverFill      = { 46.0f / 255.0f,  50.0f / 255.0f,  60.0f / 255.0f, 1.0f }; // #2E323C
+static const XSCColor kColAccent         = { 59.0f / 255.0f, 130.0f / 255.0f, 246.0f / 255.0f, 1.0f }; // #3B82F6
+static const XSCColor kColAccentHover    = { 79.0f / 255.0f, 145.0f / 255.0f, 248.0f / 255.0f, 1.0f }; // #4F91F8
+static const XSCColor kColAccentTint     = { 59.0f / 255.0f, 130.0f / 255.0f, 246.0f / 255.0f, 0.20f };
+static const XSCColor kColAccentBorder   = { 59.0f / 255.0f, 130.0f / 255.0f, 246.0f / 255.0f, 0.58f };
+static const XSCColor kColTextPrimary    = { 232.0f / 255.0f, 234.0f / 255.0f, 240.0f / 255.0f, 1.0f }; // #E8EAF0
+static const XSCColor kColTextSecondary  = { 154.0f / 255.0f, 160.0f / 255.0f, 173.0f / 255.0f, 1.0f }; // #9AA0AD
+static const XSCColor kColTextMuted      = { 112.0f / 255.0f, 119.0f / 255.0f, 134.0f / 255.0f, 1.0f }; // #707786
+static const XSCColor kColTextWhite      = { 1.0f, 1.0f, 1.0f, 1.0f };
+static const XSCColor kColErrorBg        = { 46.0f / 255.0f,  24.0f / 255.0f,  28.0f / 255.0f, 0.96f };
+static const XSCColor kColErrorBorder    = { 145.0f / 255.0f, 52.0f / 255.0f,  60.0f / 255.0f, 1.0f };
+static const XSCColor kColErrorText      = { 252.0f / 255.0f, 165.0f / 255.0f, 165.0f / 255.0f, 1.0f };
+static const XSCColor kColShadow         = { 0.0f, 0.0f, 0.0f, 0.48f };
+static const XSCColor kColScrim          = { 8.0f / 255.0f,   9.0f / 255.0f,   12.0f / 255.0f, 0.56f };
+static const XSCColor kColClear          = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+#pragma mark - Optional Helpers
+
+static XSCBook *xsc_unwrap_book(XSCOptBook opt) {
+    match(opt) {
+        case .Some(let b): { return b; }
+        case .None: { return nil; }
+    }
+}
+
+static XSCString *xsc_unwrap_opt_string(XSCOptString opt) {
+    match(opt) {
+        case .Some(let s): { return s; }
+        case .None: { return nil; }
+    }
+}
+
+static bool xsc_opt_page_has_value(XSCOptDecodedPage opt) {
+    match(opt) {
+        case .Some(let p): { return p != nil; }
+        case .None: { return false; }
+    }
+}
+
+#pragma mark - Preferences ($XDG_CONFIG_HOME/xscomic/prefs.ini)
+
+typedef struct XSCPrefs {
+    bool swapRTLPageTurnKeys;
+    bool continueAcrossVolumes;
+} XSCPrefs;
+
+static bool xsc_prefs_path(char *outBuf, size_t outCap) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0] == '/') {
+        size_t len = strlen(xdg);
+        while (len > 1u && xdg[len - 1u] == '/') len--;
+        int n = snprintf(outBuf, outCap, "%.*s/xscomic/prefs.ini", (int)len, xdg);
+        return n > 0 && (size_t)n < outCap;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0] != '\0') {
+        size_t len = strlen(home);
+        while (len > 1u && home[len - 1u] == '/') len--;
+        int n = snprintf(outBuf, outCap, "%.*s/.config/xscomic/prefs.ini", (int)len, home);
+        return n > 0 && (size_t)n < outCap;
+    }
+    return false;
+}
+
+static void xsc_mkdir_parents(const char *filePath) {
+    char buf[PATH_MAX];
+    size_t len = strlen(filePath);
+    if (len == 0u || len >= sizeof(buf)) return;
+    memcpy(buf, filePath, len + 1u);
+    for (size_t i = 1u; i < len; i++) {
+        if (buf[i] == '/') {
+            buf[i] = '\0';
+            (void)mkdir(buf, 0755);
+            buf[i] = '/';
+        }
+    }
+}
+
+static void xsc_prefs_load(XSCPrefs *prefs) {
+    prefs->swapRTLPageTurnKeys = false;
+    prefs->continueAcrossVolumes = true;
+
+    char path[PATH_MAX];
+    if (!xsc_prefs_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    defer { fclose(f); }
+
+    char line[256];
+    while (fgets(line, (int)sizeof(line), f) != NULL) {
+        char *key = line;
+        while (*key == ' ' || *key == '\t') key++;
+        if (*key == '\0' || *key == '#' || *key == ';' || *key == '\n' || *key == '\r') {
+            continue;
+        }
+        char *eq = strchr(key, '=');
+        if (!eq) continue;
+        char *keyEnd = eq;
+        while (keyEnd > key && (keyEnd[-1] == ' ' || keyEnd[-1] == '\t')) keyEnd--;
+        *keyEnd = '\0';
+        const char *val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        bool truthy = (val[0] == '1' || val[0] == 't' || val[0] == 'T' || val[0] == 'y' || val[0] == 'Y');
+        if (strcmp(key, "swapRTLPageTurnKeys") == 0) {
+            prefs->swapRTLPageTurnKeys = truthy;
+        } else if (strcmp(key, "continueAcrossVolumes") == 0) {
+            prefs->continueAcrossVolumes = truthy;
+        }
+    }
+}
+
+static void xsc_prefs_save(const XSCPrefs *prefs) {
+    char path[PATH_MAX];
+    if (!xsc_prefs_path(path, sizeof(path))) return;
+    xsc_mkdir_parents(path);
+
+    char tmpPath[PATH_MAX];
+    int n = snprintf(tmpPath, sizeof(tmpPath), "%s.tmp.%ld", path, (long)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(tmpPath)) return;
+
+    FILE *f = fopen(tmpPath, "w");
+    if (!f) return;
+    bool ok = (fprintf(f, "swapRTLPageTurnKeys=%d\n", prefs->swapRTLPageTurnKeys ? 1 : 0) > 0)
+           && (fprintf(f, "continueAcrossVolumes=%d\n", prefs->continueAcrossVolumes ? 1 : 0) > 0)
+           && (fflush(f) == 0);
+    if (fclose(f) != 0) ok = false;
+
+    if (ok && rename(tmpPath, path) == 0) {
+        return;
+    }
+    unlink(tmpPath);
+}
+
+#pragma mark - PNG Screenshot Writer (libpng)
+
+static bool xsc_png_write_rows(png_structp png,
+                               png_infop info,
+                               FILE *fp,
+                               int width,
+                               int height,
+                               const uint8_t *rgbaBottomUp) {
+    if (setjmp(png_jmpbuf(png))) {
+        return false;
+    }
+    png_init_io(png, fp);
+    png_set_IHDR(png,
+                 info,
+                 (png_uint_32)width,
+                 (png_uint_32)height,
+                 8,
+                 PNG_COLOR_TYPE_RGBA,
+                 PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT,
+                 PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    size_t rowBytes = (size_t)width * 4u;
+    for (int y = 0; y < height; y++) {
+        // Flip OpenGL bottom-left framebuffer rows into top-left PNG order.
+        const png_byte *row = (const png_byte *)(rgbaBottomUp + (size_t)(height - 1 - y) * rowBytes);
+        png_write_row(png, row);
+    }
+    png_write_end(png, NULL);
+    return true;
+}
+
+static bool xsc_write_rgba_png(const char *path, int width, int height, const uint8_t *rgbaBottomUp) {
+    if (!path || width <= 0 || height <= 0 || !rgbaBottomUp) return false;
+    const char *slash = strrchr(path, '/');
+    size_t directoryLength = slash ? (size_t)(slash - path) + 1u : 0u;
+    char tempPath[PATH_MAX];
+    if (directoryLength >= sizeof(tempPath)) return false;
+    int written = snprintf(tempPath, sizeof(tempPath), "%.*s.xscomic-screenshot-XXXXXX",
+                           (int)directoryLength, path);
+    if (written < 0 || (size_t)written >= sizeof(tempPath)) return false;
+
+    int fd = mkostemp(tempPath, O_CLOEXEC);
+    if (fd < 0) return false;
+    defer { if (tempPath[0] != '\0') unlink(tempPath); }
+
+    mode_t mask = umask(0);
+    umask(mask);
+    (void)fchmod(fd, (mode_t)(0666 & ~mask));
+
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        close(fd);
+        return false;
+    }
+    defer { if (fp) fclose(fp); }
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png) return false;
+    png_infop info = png_create_info_struct(png);
+    defer { png_destroy_write_struct(&png, info ? &info : NULL); }
+    if (!info) return false;
+
+    bool ok = xsc_png_write_rows(png, info, fp, width, height, rgbaBottomUp);
+    if (fclose(fp) != 0) ok = false;
+    fp = NULL;
+    if (!ok || rename(tempPath, path) != 0) return false;
+    tempPath[0] = '\0';
+    return true;
+}
+
+#pragma mark - OpenGL 3.3 2D Chrome & Typography Renderer
+
+typedef enum XSCFontSlot {
+    XSCFontRegular13 = 0,
+    XSCFontBold13    = 1,
+    XSCFontSmall11   = 2,
+    XSCFontMono13    = 3,
+    XSCFontModal16   = 4,
+    XSCFontHero28    = 5,
+    XSCFontCount     = 6,
+} XSCFontSlot;
+
+static const char * const kXSCUIVertexShader =
+    "#version 330 core\n"
+    "uniform vec4 uRectPx;\n"
+    "uniform vec2 uViewportPx;\n"
+    "out vec2 vUV;\n"
+    "out vec2 vLocalPx;\n"
+    "void main() {\n"
+    "    const vec2 k[6] = vec2[6](\n"
+    "        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),\n"
+    "        vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)\n"
+    "    );\n"
+    "    vec2 c = k[gl_VertexID];\n"
+    "    vec2 p = uRectPx.xy + c * uRectPx.zw;\n"
+    "    float nx = (p.x / max(uViewportPx.x, 1.0)) * 2.0 - 1.0;\n"
+    "    float ny = 1.0 - (p.y / max(uViewportPx.y, 1.0)) * 2.0;\n"
+    "    gl_Position = vec4(nx, ny, 0.0, 1.0);\n"
+    "    vUV = c;\n"
+    "    vLocalPx = c * uRectPx.zw;\n"
+    "}\n";
+
+static const char * const kXSCUIFragmentShader =
+    "#version 330 core\n"
+    "in vec2 vUV;\n"
+    "in vec2 vLocalPx;\n"
+    "out vec4 fragColor;\n"
+    "uniform vec4 uRectPx;\n"
+    "uniform vec4 uFillColor;\n"
+    "uniform vec4 uBorderColor;\n"
+    "uniform float uRadiusPx;\n"
+    "uniform float uBorderPx;\n"
+    "uniform float uSoftnessPx;\n"
+    "uniform int uMode;\n"
+    "uniform sampler2D uTex;\n"
+    "\n"
+    "void main() {\n"
+    "    if (uMode == 1) {\n"
+    "        vec4 t = texture(uTex, vUV);\n"
+    "        fragColor = vec4(t.rgb * uFillColor.rgb, t.a * uFillColor.a);\n"
+    "        return;\n"
+    "    }\n"
+    "    vec2 halfSize = uRectPx.zw * 0.5;\n"
+    "    float r = min(uRadiusPx, min(halfSize.x, halfSize.y));\n"
+    "    vec2 q = abs(vLocalPx - halfSize) - (halfSize - vec2(r));\n"
+    "    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
+    "    float outerAlpha;\n"
+    "    if (uSoftnessPx > 1.0) {\n"
+    "        float t = 1.0 - smoothstep(-uSoftnessPx, 0.0, d);\n"
+    "        outerAlpha = t * t;\n"
+    "    } else {\n"
+    "        outerAlpha = 1.0 - smoothstep(-0.5, 0.5, d);\n"
+    "    }\n"
+    "    if (outerAlpha <= 0.001) discard;\n"
+    "    vec4 col = uFillColor;\n"
+    "    if (uBorderPx > 0.0 && uBorderColor.a > 0.0) {\n"
+    "        float bf = smoothstep(-uBorderPx - 0.5, -uBorderPx + 0.5, d);\n"
+    "        float ba = uBorderColor.a * bf;\n"
+    "        float outA = ba + uFillColor.a * (1.0 - ba);\n"
+    "        vec3 outRGB = (outA > 1e-5)\n"
+    "            ? (uBorderColor.rgb * ba + uFillColor.rgb * uFillColor.a * (1.0 - ba)) / outA\n"
+    "            : vec3(0.0);\n"
+    "        col = vec4(outRGB, outA);\n"
+    "    }\n"
+    "    fragColor = vec4(col.rgb, col.a * outerAlpha);\n"
+    "}\n";
+
+static const size_t kXSCTextCacheCapacity = 160u;
+
+typedef struct XSCTextCacheEntry {
+    char *text;
+    XSCFontSlot fontSlot;
+    GLuint texID;
+    int texW;
+    int texH;
+    uint64_t lastUsedFrame;
+} XSCTextCacheEntry;
+
+static const char *xsc_find_font_path(int style) {
+    // style: 0 = regular, 1 = bold, 2 = mono
+    static const char * const kRegularPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        NULL
+    };
+    static const char * const kBoldPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        NULL
+    };
+    static const char * const kMonoPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        NULL
+    };
+    const char * const *list = (style == 1) ? kBoldPaths : ((style == 2) ? kMonoPaths : kRegularPaths);
+    for (size_t i = 0u; list[i] != NULL; i++) {
+        if (access(list[i], R_OK) == 0) return list[i];
+    }
+    return NULL;
+}
+
+@interface XSCUIRenderer : XSCObject
+- (void)initializeGL throws(XSCError *);
+- (void)shutdownGL;
+- (void)beginFrameWithDrawableWidth:(int)drawableW
+                     drawableHeight:(int)drawableH
+                       backingScale:(float)scale;
+- (void)endFrame;
+- (void)pushScissorRect:(XSCRectF)logicalRect;
+- (void)popScissor;
+- (void)drawRect:(XSCRectF)r fill:(XSCColor)fill;
+- (void)drawRoundedRect:(XSCRectF)r
+                 radius:(float)radius
+                   fill:(XSCColor)fill
+                 border:(XSCColor)border
+            borderWidth:(float)borderWidth;
+- (void)drawShadowForRect:(XSCRectF)r radius:(float)radius spread:(float)spread offsetY:(float)offsetY;
+- (float)measureTextWidth:(const char *)utf8 font:(XSCFontSlot)slot;
+- (float)fontHeight:(XSCFontSlot)slot;
+- (void)drawText:(const char *)utf8
+            font:(XSCFontSlot)slot
+               x:(float)x
+               y:(float)y
+           color:(XSCColor)color;
+- (void)drawTextCentered:(const char *)utf8
+                    font:(XSCFontSlot)slot
+                  inRect:(XSCRectF)r
+                   color:(XSCColor)color;
+- (void)drawTextEllipsized:(const char *)utf8
+                      font:(XSCFontSlot)slot
+                         x:(float)x
+                         y:(float)y
+                  maxWidth:(float)maxW
+                     color:(XSCColor)color;
+@end
+
+@implementation XSCUIRenderer {
+    XSCGLProcs _gl;
+    bool _glReady;
+    GLuint _program;
+    GLuint _vao;
+
+    GLint _uRectPxLoc;
+    GLint _uViewportPxLoc;
+    GLint _uFillColorLoc;
+    GLint _uBorderColorLoc;
+    GLint _uRadiusPxLoc;
+    GLint _uBorderPxLoc;
+    GLint _uSoftnessPxLoc;
+    GLint _uModeLoc;
+    GLint _uTexLoc;
+
+    int _drawableW;
+    int _drawableH;
+    float _scale;
+    float _loadedFontScale;
+    uint64_t _frameCounter;
+
+    TTF_Font *_fonts[XSCFontCount];
+    XSCTextCacheEntry _cache[160];
+}
+
+- (void)dealloc {
+    if (_glReady && SDL_GL_GetCurrentContext() != NULL) {
+        [self shutdownGL];
+    } else {
+        [self closeFonts];
+        for (size_t i = 0u; i < kXSCTextCacheCapacity; i++) {
+            free(_cache[i].text);
+            _cache[i].text = NULL;
+            _cache[i].texID = 0u;
+        }
+    }
+}
+
+- (void)initializeGL throws(XSCError *) {
+    if (_glReady) return;
+    if (!xsc_gl_load_procs(&_gl)) {
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI code:200 message:"UI GL 3.3 procs missing."];
+        throwError(err);
+    }
+
+    GLuint prog = tryValue(xsc_gl_build_program(&_gl,
+                                                kXSCUIVertexShader,
+                                                kXSCUIFragmentShader,
+                                                "UI",
+                                                200));
+
+    GLuint vao = 0u;
+    _gl.genVertexArrays(1, &vao);
+    if (vao == 0u) {
+        _gl.deleteProgram(prog);
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI code:205 message:"UI VAO alloc failed."];
+        throwError(err);
+    }
+
+    _program = prog;
+    _vao = vao;
+    _uRectPxLoc      = _gl.getUniformLocation(_program, "uRectPx");
+    _uViewportPxLoc  = _gl.getUniformLocation(_program, "uViewportPx");
+    _uFillColorLoc   = _gl.getUniformLocation(_program, "uFillColor");
+    _uBorderColorLoc = _gl.getUniformLocation(_program, "uBorderColor");
+    _uRadiusPxLoc    = _gl.getUniformLocation(_program, "uRadiusPx");
+    _uBorderPxLoc    = _gl.getUniformLocation(_program, "uBorderPx");
+    _uSoftnessPxLoc  = _gl.getUniformLocation(_program, "uSoftnessPx");
+    _uModeLoc        = _gl.getUniformLocation(_program, "uMode");
+    _uTexLoc         = _gl.getUniformLocation(_program, "uTex");
+    _glReady = true;
+    _scale = 1.0f;
+    [self ensureFontsForScale:1.0f];
+}
+
+- (void)clearTextCache {
+    for (size_t i = 0u; i < kXSCTextCacheCapacity; i++) {
+        if (_cache[i].texID != 0u && _glReady) {
+            glDeleteTextures(1, &_cache[i].texID);
+        }
+        _cache[i].texID = 0u;
+        free(_cache[i].text);
+        _cache[i].text = NULL;
+        _cache[i].texW = 0;
+        _cache[i].texH = 0;
+        _cache[i].lastUsedFrame = 0ULL;
+    }
+}
+
+- (void)closeFonts {
+    for (int i = 0; i < XSCFontCount; i++) {
+        if (_fonts[i]) {
+            TTF_CloseFont(_fonts[i]);
+            _fonts[i] = NULL;
+        }
+    }
+    _loadedFontScale = 0.0f;
+}
+
+- (void)ensureFontsForScale:(float)scale {
+    float clamped = fmaxf(1.0f, fminf(4.0f, scale));
+    if (_loadedFontScale > 0.0f && fabsf(_loadedFontScale - clamped) < 0.05f) {
+        return;
+    }
+    [self clearTextCache];
+    [self closeFonts];
+
+    const char *regPath  = xsc_find_font_path(0);
+    const char *boldPath = xsc_find_font_path(1);
+    const char *monoPath = xsc_find_font_path(2);
+    if (!boldPath) boldPath = regPath;
+    if (!monoPath) monoPath = regPath;
+
+    const int baseSizes[XSCFontCount] = { 13, 13, 11, 13, 16, 28 };
+    const char *paths[XSCFontCount] = {
+        regPath, boldPath, regPath, monoPath, boldPath, boldPath
+    };
+    for (int i = 0; i < XSCFontCount; i++) {
+        if (paths[i]) {
+            int px = (int)lroundf((float)baseSizes[i] * clamped);
+            if (px < 8) px = 8;
+            _fonts[i] = TTF_OpenFont(paths[i], px);
+            if (_fonts[i]) {
+                TTF_SetFontHinting(_fonts[i], TTF_HINTING_LIGHT);
+            }
+        }
+    }
+    _loadedFontScale = clamped;
+}
+
+- (void)shutdownGL {
+    [self clearTextCache];
+    [self closeFonts];
+    if (!_glReady) return;
+    if (_vao != 0u && _gl.deleteVertexArrays) {
+        _gl.deleteVertexArrays(1, &_vao);
+        _vao = 0u;
+    }
+    if (_program != 0u && _gl.deleteProgram) {
+        _gl.deleteProgram(_program);
+        _program = 0u;
+    }
+    _glReady = false;
+}
+
+- (void)beginFrameWithDrawableWidth:(int)drawableW
+                     drawableHeight:(int)drawableH
+                       backingScale:(float)scale {
+    if (!_glReady) return;
+    _drawableW = drawableW > 0 ? drawableW : 1;
+    _drawableH = drawableH > 0 ? drawableH : 1;
+    _scale = scale > 0.0f ? scale : 1.0f;
+    _frameCounter++;
+    [self ensureFontsForScale:_scale];
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    if (_gl.blendFuncSeparate) {
+        _gl.blendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+    glViewport(0, 0, _drawableW, _drawableH);
+
+    _gl.useProgram(_program);
+    _gl.bindVertexArray(_vao);
+    _gl.uniform2f(_uViewportPxLoc, (float)_drawableW, (float)_drawableH);
+}
+
+- (void)endFrame {
+    if (!_glReady) return;
+    glDisable(GL_SCISSOR_TEST);
+    glBindTexture(GL_TEXTURE_2D, 0u);
+    _gl.bindVertexArray(0u);
+    _gl.useProgram(0u);
+}
+
+- (void)pushScissorRect:(XSCRectF)r {
+    GLint lx = (GLint)lroundf(r.x * _scale);
+    GLint rx = (GLint)lroundf((r.x + r.width) * _scale);
+    GLint ty = (GLint)lroundf(r.y * _scale);
+    GLint by = (GLint)lroundf((r.y + r.height) * _scale);
+    GLsizei w = rx - lx;
+    GLsizei h = by - ty;
+    GLint gy = _drawableH - by;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(lx, gy, w, h);
+}
+
+- (void)popScissor {
+    glDisable(GL_SCISSOR_TEST);
+}
+
+- (void)drawRoundedRect:(XSCRectF)r
+                 radius:(float)radius
+                   fill:(XSCColor)fill
+                 border:(XSCColor)border
+            borderWidth:(float)borderWidth {
+    if (!_glReady || r.width <= 0.0f || r.height <= 0.0f) return;
+    _gl.uniform1i(_uModeLoc, 0);
+    _gl.uniform4f(_uRectPxLoc, r.x * _scale, r.y * _scale, r.width * _scale, r.height * _scale);
+    _gl.uniform4f(_uFillColorLoc, fill.r, fill.g, fill.b, fill.a);
+    _gl.uniform4f(_uBorderColorLoc, border.r, border.g, border.b, border.a);
+    _gl.uniform1f(_uRadiusPxLoc, radius * _scale);
+    _gl.uniform1f(_uBorderPxLoc, borderWidth * _scale);
+    _gl.uniform1f(_uSoftnessPxLoc, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+- (void)drawRect:(XSCRectF)r fill:(XSCColor)fill {
+    [self drawRoundedRect:r radius:0.0f fill:fill border:kColClear borderWidth:0.0f];
+}
+
+- (void)drawShadowForRect:(XSCRectF)r radius:(float)radius spread:(float)spread offsetY:(float)offsetY {
+    if (!_glReady) return;
+    float s = spread;
+    XSCRectF sr = { r.x - s, r.y - s + offsetY, r.width + 2.0f * s, r.height + 2.0f * s };
+    _gl.uniform1i(_uModeLoc, 0);
+    _gl.uniform4f(_uRectPxLoc, sr.x * _scale, sr.y * _scale, sr.width * _scale, sr.height * _scale);
+    _gl.uniform4f(_uFillColorLoc, kColShadow.r, kColShadow.g, kColShadow.b, kColShadow.a);
+    _gl.uniform4f(_uBorderColorLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+    _gl.uniform1f(_uRadiusPxLoc, (radius + s * 0.5f) * _scale);
+    _gl.uniform1f(_uBorderPxLoc, 0.0f);
+    _gl.uniform1f(_uSoftnessPxLoc, fmaxf(2.0f, s * _scale));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+- (XSCTextCacheEntry *)lookupOrCreateText:(const char *)utf8 font:(XSCFontSlot)slot {
+    if (!utf8 || utf8[0] == '\0' || slot < 0 || slot >= XSCFontCount || !_fonts[slot]) {
+        return NULL;
+    }
+    size_t emptyIdx = kXSCTextCacheCapacity;
+    size_t lruIdx = 0u;
+    uint64_t lruFrame = UINT64_MAX;
+
+    for (size_t i = 0u; i < kXSCTextCacheCapacity; i++) {
+        XSCTextCacheEntry *e = &_cache[i];
+        if (e->texID != 0u && e->fontSlot == slot && e->text && strcmp(e->text, utf8) == 0) {
+            e->lastUsedFrame = _frameCounter;
+            return e;
+        }
+        if (e->texID == 0u && emptyIdx == kXSCTextCacheCapacity) {
+            emptyIdx = i;
+        }
+        if (e->lastUsedFrame < lruFrame) {
+            lruFrame = e->lastUsedFrame;
+            lruIdx = i;
+        }
+    }
+
+    size_t dstIdx = (emptyIdx < kXSCTextCacheCapacity) ? emptyIdx : lruIdx;
+    XSCTextCacheEntry *dst = &_cache[dstIdx];
+    if (dst->texID != 0u) {
+        glDeleteTextures(1, &dst->texID);
+        dst->texID = 0u;
+    }
+    free(dst->text);
+    dst->text = NULL;
+
+    SDL_Color white = { 255, 255, 255, 255 };
+    SDL_Surface *raw = TTF_RenderUTF8_Blended(_fonts[slot], utf8, white);
+    if (!raw) return NULL;
+    defer { SDL_FreeSurface(raw); }
+
+    SDL_Surface *rgba = SDL_ConvertSurfaceFormat(raw, SDL_PIXELFORMAT_RGBA32, 0);
+    if (!rgba) return NULL;
+    defer { SDL_FreeSurface(rgba); }
+
+    GLuint tex = 0u;
+    glGenTextures(1, &tex);
+    if (tex == 0u) return NULL;
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    GLint rowLen = (rgba->pitch > rgba->w * 4 && (rgba->pitch % 4) == 0) ? (rgba->pitch / 4) : 0;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLen);
+    defer {
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glBindTexture(GL_TEXTURE_2D, 0u);
+    }
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rgba->w, rgba->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
+
+    char *textCopy = strdup(utf8);
+    if (!textCopy) {
+        glDeleteTextures(1, &tex);
+        return NULL;
+    }
+
+    dst->text = textCopy;
+    dst->fontSlot = slot;
+    dst->texID = tex;
+    dst->texW = rgba->w;
+    dst->texH = rgba->h;
+    dst->lastUsedFrame = _frameCounter;
+    return dst;
+}
+
+- (float)measureTextWidth:(const char *)utf8 font:(XSCFontSlot)slot {
+    if (!utf8 || utf8[0] == '\0' || slot < 0 || slot >= XSCFontCount || !_fonts[slot]) {
+        return 0.0f;
+    }
+    int w = 0, h = 0;
+    if (TTF_SizeUTF8(_fonts[slot], utf8, &w, &h) != 0) return 0.0f;
+    return (float)w / _scale;
+}
+
+- (float)fontHeight:(XSCFontSlot)slot {
+    if (slot < 0 || slot >= XSCFontCount || !_fonts[slot]) return 14.0f;
+    return (float)TTF_FontHeight(_fonts[slot]) / _scale;
+}
+
+- (void)drawTextEntry:(const XSCTextCacheEntry *)entry
+                    x:(float)x
+                    y:(float)y
+                color:(XSCColor)color {
+    float px = floorf(x * _scale + 0.5f);
+    float py = floorf(y * _scale + 0.5f);
+
+    _gl.uniform1i(_uModeLoc, 1);
+    _gl.uniform4f(_uRectPxLoc, px, py, (float)entry->texW, (float)entry->texH);
+    _gl.uniform4f(_uFillColorLoc, color.r, color.g, color.b, color.a);
+    _gl.activeTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, entry->texID);
+    _gl.uniform1i(_uTexLoc, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+- (void)drawText:(const char *)utf8
+            font:(XSCFontSlot)slot
+               x:(float)x
+               y:(float)y
+           color:(XSCColor)color {
+    if (!_glReady) return;
+    XSCTextCacheEntry *entry = [self lookupOrCreateText:utf8 font:slot];
+    if (!entry || entry->texID == 0u) return;
+    [self drawTextEntry:entry x:x y:y color:color];
+}
+
+- (void)drawTextCentered:(const char *)utf8
+                    font:(XSCFontSlot)slot
+                  inRect:(XSCRectF)r
+                   color:(XSCColor)color {
+    if (!_glReady) return;
+    XSCTextCacheEntry *entry = [self lookupOrCreateText:utf8 font:slot];
+    if (!entry || entry->texID == 0u) return;
+
+    float w = (float)entry->texW / _scale;
+    float h = (float)entry->texH / _scale;
+    [self drawTextEntry:entry
+                      x:r.x + (r.width - w) * 0.5f
+                      y:r.y + (r.height - h) * 0.5f
+                  color:color];
+}
+
+- (void)drawTextEllipsized:(const char *)utf8
+                      font:(XSCFontSlot)slot
+                         x:(float)x
+                         y:(float)y
+                  maxWidth:(float)maxW
+                     color:(XSCColor)color {
+    if (!utf8 || utf8[0] == '\0' || maxW < 12.0f) return;
+    if ([self measureTextWidth:utf8 font:slot] <= maxW) {
+        [self drawText:utf8 font:slot x:x y:y color:color];
+        return;
+    }
+
+    char buf[256];
+    size_t srcLen = strlen(utf8);
+    if (srcLen > sizeof(buf) - 5u) {
+        srcLen = sizeof(buf) - 5u;
+        while (srcLen > 0u && (((uint8_t)utf8[srcLen] & 0xC0u) == 0x80u)) {
+            srcLen--;
+        }
+    }
+
+    // Collect valid UTF-8 codepoint boundaries and binary-search the longest fitting prefix.
+    size_t bounds[256];
+    size_t count = 0u;
+    bounds[count++] = 0u;
+    for (size_t i = 1u; i <= srcLen && count < 256u; i++) {
+        if (i == srcLen || (((uint8_t)utf8[i] & 0xC0u) != 0x80u)) {
+            bounds[count++] = i;
+        }
+    }
+
+    size_t lo = 0u;
+    size_t hi = (count > 1u) ? (count - 1u) : 0u;
+    size_t best = 0u;
+    bool found = false;
+
+    while (lo <= hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        size_t cut = bounds[mid];
+        if (cut > 0u) memcpy(buf, utf8, cut);
+        buf[cut]     = (char)0xE2;
+        buf[cut + 1] = (char)0x80;
+        buf[cut + 2] = (char)0xA6;
+        buf[cut + 3] = '\0';
+        if ([self measureTextWidth:buf font:slot] <= maxW) {
+            best = cut;
+            found = true;
+            lo = mid + 1u;
+        } else {
+            if (mid == 0u) break;
+            hi = mid - 1u;
+        }
+    }
+
+    if (found) {
+        if (best > 0u) memcpy(buf, utf8, best);
+        buf[best]     = (char)0xE2;
+        buf[best + 1] = (char)0x80;
+        buf[best + 2] = (char)0xA6;
+        buf[best + 3] = '\0';
+        [self drawText:buf font:slot x:x y:y color:color];
+    }
+}
+
+@end
+
+#pragma mark - Crisp Vector-Style UI Icon Helpers
+
+static void xsc_draw_sidebar_icon(XSCUIRenderer *ui, XSCRectF btn, XSCColor col) {
+    float cx = floorf(btn.x + (btn.width - 15.0f) * 0.5f);
+    float cy = floorf(btn.y + (btn.height - 12.0f) * 0.5f);
+    [ui drawRoundedRect:(XSCRectF){ cx, cy, 15.0f, 12.0f } radius:2.0f fill:kColClear border:col borderWidth:1.3f];
+    [ui drawRect:(XSCRectF){ cx + 5.0f, cy + 1.0f, 1.2f, 10.0f } fill:col];
+    [ui drawRect:(XSCRectF){ cx + 2.0f, cy + 4.0f, 2.0f, 1.2f } fill:col];
+    [ui drawRect:(XSCRectF){ cx + 2.0f, cy + 7.0f, 2.0f, 1.2f } fill:col];
+}
+
+static void xsc_draw_folder_icon(XSCUIRenderer *ui, float x, float y, XSCColor col) {
+    [ui drawRoundedRect:(XSCRectF){ x, y, 5.5f, 3.0f } radius:1.0f fill:col border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ x, y + 2.0f, 13.0f, 9.0f } radius:1.8f fill:kColClear border:col borderWidth:1.3f];
+}
+
+static void xsc_draw_single_icon(XSCUIRenderer *ui, float x, float y, XSCColor col) {
+    [ui drawRoundedRect:(XSCRectF){ x, y, 8.0f, 11.0f } radius:1.5f fill:kColClear border:col borderWidth:1.3f];
+}
+
+static void xsc_draw_spread_icon(XSCUIRenderer *ui, float x, float y, XSCColor col) {
+    [ui drawRoundedRect:(XSCRectF){ x, y, 6.5f, 11.0f } radius:1.2f fill:kColClear border:col borderWidth:1.25f];
+    [ui drawRoundedRect:(XSCRectF){ x + 7.5f, y, 6.5f, 11.0f } radius:1.2f fill:kColClear border:col borderWidth:1.25f];
+}
+
+static void xsc_draw_minus_icon(XSCUIRenderer *ui, XSCRectF btn, XSCColor col) {
+    float cx = floorf(btn.x + (btn.width - 10.0f) * 0.5f);
+    float cy = floorf(btn.y + (btn.height - 1.6f) * 0.5f);
+    [ui drawRoundedRect:(XSCRectF){ cx, cy, 10.0f, 1.6f } radius:0.8f fill:col border:kColClear borderWidth:0.0f];
+}
+
+static void xsc_draw_plus_icon(XSCUIRenderer *ui, XSCRectF btn, XSCColor col) {
+    float cx = floorf(btn.x + (btn.width - 10.0f) * 0.5f);
+    float cy = floorf(btn.y + (btn.height - 1.6f) * 0.5f);
+    [ui drawRoundedRect:(XSCRectF){ cx, cy, 10.0f, 1.6f } radius:0.8f fill:col border:kColClear borderWidth:0.0f];
+    float vx = floorf(btn.x + (btn.width - 1.6f) * 0.5f);
+    float vy = floorf(btn.y + (btn.height - 10.0f) * 0.5f);
+    [ui drawRoundedRect:(XSCRectF){ vx, vy, 1.6f, 10.0f } radius:0.8f fill:col border:kColClear borderWidth:0.0f];
+}
+
+static void xsc_draw_prefs_icon(XSCUIRenderer *ui, XSCRectF btn, XSCColor col) {
+    float x = floorf(btn.x + (btn.width - 14.0f) * 0.5f);
+    float y = floorf(btn.y + (btn.height - 11.0f) * 0.5f);
+    // Three sleek studio slider bars with indicator knobs.
+    [ui drawRoundedRect:(XSCRectF){ x, y + 1.0f, 14.0f, 1.4f } radius:0.7f fill:col border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ x + 3.0f, y, 3.4f, 3.4f } radius:1.7f fill:col border:kColClear borderWidth:0.0f];
+
+    [ui drawRoundedRect:(XSCRectF){ x, y + 5.0f, 14.0f, 1.4f } radius:0.7f fill:col border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ x + 8.0f, y + 4.0f, 3.4f, 3.4f } radius:1.7f fill:col border:kColClear borderWidth:0.0f];
+
+    [ui drawRoundedRect:(XSCRectF){ x, y + 9.0f, 14.0f, 1.4f } radius:0.7f fill:col border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ x + 4.5f, y + 8.0f, 3.4f, 3.4f } radius:1.7f fill:col border:kColClear borderWidth:0.0f];
+}
+
+static void xsc_draw_empty_emblem(XSCUIRenderer *ui, float cx, float y) {
+    // Minimal two-page spread emblem with subtle comic panel hints.
+    float leftX = cx - 34.0f;
+    float rightX = cx + 2.0f;
+    XSCColor pageFill = xsc_rgb(36, 40, 49);
+    XSCColor pageBorder = xsc_rgb(59, 66, 80);
+    XSCColor panelFill = xsc_rgb(47, 52, 64);
+
+    [ui drawRoundedRect:(XSCRectF){ leftX, y, 32.0f, 44.0f } radius:4.0f fill:pageFill border:pageBorder borderWidth:1.2f];
+    [ui drawRoundedRect:(XSCRectF){ rightX, y, 32.0f, 44.0f } radius:4.0f fill:pageFill border:pageBorder borderWidth:1.2f];
+
+    // Left page panels
+    [ui drawRoundedRect:(XSCRectF){ leftX + 5.0f, y + 6.0f, 22.0f, 14.0f } radius:2.0f fill:panelFill border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ leftX + 5.0f, y + 23.0f, 10.0f, 15.0f } radius:2.0f fill:panelFill border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ leftX + 17.0f, y + 23.0f, 10.0f, 15.0f } radius:2.0f fill:kColAccentTint border:kColAccentBorder borderWidth:1.0f];
+
+    // Right page panels
+    [ui drawRoundedRect:(XSCRectF){ rightX + 5.0f, y + 6.0f, 22.0f, 20.0f } radius:2.0f fill:panelFill border:kColClear borderWidth:0.0f];
+    [ui drawRoundedRect:(XSCRectF){ rightX + 5.0f, y + 29.0f, 22.0f, 9.0f } radius:2.0f fill:panelFill border:kColClear borderWidth:0.0f];
+
+    // Subtle accent spine highlight
+    [ui drawRoundedRect:(XSCRectF){ cx - 1.0f, y + 4.0f, 2.0f, 36.0f } radius:1.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+}
+
+#pragma mark - CLI Options & Layout Geometry
+
+typedef struct XSCCLIOptions {
+    const char *bookPath;
+    const char *screenshotPath;
+    int startMode;       // -1 = default, 0 = single, 1 = double
+    int startDir;        // -1 = default, 0 = LTR, 1 = RTL
+    bool startSidebar;
+    bool startJumpModal;
+    bool startSettings;
+    int64_t startPage;   // 0 = unset, >= 1 = 1-based page
+    float startZoom;     // 0.0 = unset, > 0 = custom scale
+    int startWidth;      // 0 = default (1280)
+    int startHeight;     // 0 = default (800)
+} XSCCLIOptions;
+
+typedef struct XSCLayout {
+    float winW;
+    float winH;
+    bool compactMode;
+    bool compactOpen;
+
+    XSCRectF toolbar;
+    XSCRectF btnSidebar;
+    XSCRectF btnOpen;
+    XSCRectF titleRect;
+
+    XSCRectF segDir;
+    XSCRectF segDirLTR;
+    XSCRectF segDirRTL;
+
+    XSCRectF segMode;
+    XSCRectF segModeSingle;
+    XSCRectF segModeDouble;
+
+    XSCRectF btnPageIndicator;
+
+    XSCRectF zoomGroup;
+    XSCRectF btnZoomOut;
+    XSCRectF btnZoomLabel;
+    XSCRectF btnZoomIn;
+    XSCRectF btnPrefs;
+
+    XSCRectF sidebar;
+    XSCRectF sidebarList;
+    XSCRectF canvas;
+
+    // Overlays
+    XSCRectF emptyCard;
+    XSCRectF emptyOpenBtn;
+
+    XSCRectF jumpCard;
+    XSCRectF jumpInput;
+    XSCRectF jumpCancelBtn;
+    XSCRectF jumpGoBtn;
+
+    XSCRectF settingsCard;
+    XSCRectF settingsRowSwapRTL;
+    XSCRectF settingsRowContinue;
+
+    XSCRectF errorBanner;
+    XSCRectF errorDismissBtn;
+} XSCLayout;
+
+static void xsc_compute_layout(XSCLayout *L, float winW, float winH, bool showSidebar) {
+    memset(L, 0, sizeof(*L));
+    L->winW = fmaxf(1.0f, winW);
+    L->winH = fmaxf(1.0f, winH);
+    L->compactMode = (L->winW < 740.0f);
+    L->compactOpen = (L->winW < 560.0f);
+
+    const float tbH = kXSCToolbarHeight;
+    const float btnY = 8.0f;
+    const float btnH = 28.0f;
+    const float pad = L->compactMode ? 8.0f : 12.0f;
+    const float gap = L->compactMode ? 6.0f : 8.0f;
+    L->toolbar = (XSCRectF){ 0.0f, 0.0f, L->winW, tbH };
+
+    // Left group
+    float sideBtnW = L->compactMode ? 32.0f : 34.0f;
+    float openBtnW = L->compactOpen ? 32.0f : (L->compactMode ? 74.0f : 80.0f);
+    L->btnSidebar = (XSCRectF){ pad, btnY, sideBtnW, btnH };
+    L->btnOpen    = (XSCRectF){ L->btnSidebar.x + L->btnSidebar.width + gap, btnY, openBtnW, btnH };
+    float leftEnd = L->btnOpen.x + L->btnOpen.width;
+
+    // Right group
+    float prefsBtnW = L->compactMode ? 32.0f : 34.0f;
+    float zBtnW     = L->compactMode ? 26.0f : 28.0f;
+    float zLblW     = L->compactMode ? 52.0f : 60.0f;
+    float zoomW     = zBtnW + zLblW + zBtnW;
+    L->btnPrefs     = (XSCRectF){ L->winW - pad - prefsBtnW, btnY, prefsBtnW, btnH };
+    L->zoomGroup    = (XSCRectF){ L->btnPrefs.x - gap - zoomW, btnY, zoomW, btnH };
+    L->btnZoomOut   = (XSCRectF){ L->zoomGroup.x, btnY, zBtnW, btnH };
+    L->btnZoomLabel = (XSCRectF){ L->zoomGroup.x + zBtnW, btnY, zLblW, btnH };
+    L->btnZoomIn    = (XSCRectF){ L->zoomGroup.x + zBtnW + zLblW, btnY, zBtnW, btnH };
+    float rightStart = L->zoomGroup.x;
+
+    // Center group (LTR|RTL, Single|Spread, Page indicator)
+    float dirW  = L->compactMode ? 76.0f : 88.0f;
+    float modeW = L->compactMode ? 72.0f : 158.0f;
+    float indW  = L->compactMode ? 86.0f : 96.0f;
+
+    float freeLeft  = leftEnd + gap;
+    float freeRight = rightStart - gap;
+    float availMid  = fmaxf(0.0f, freeRight - freeLeft);
+    if (L->compactMode && (dirW + gap + modeW + gap + indW) > availMid) {
+        indW = fmaxf(56.0f, availMid - dirW - modeW - 2.0f * gap);
+    }
+
+    float centerW = dirW + gap + modeW + gap + indW;
+    float centerX;
+    if (L->compactMode) {
+        // Center symmetrically inside the free span between Left and Right groups.
+        centerX = floorf(freeLeft + fmaxf(0.0f, (availMid - centerW) * 0.5f));
+    } else {
+        centerX = floorf((L->winW - centerW) * 0.5f);
+        if (centerX + centerW > rightStart - 10.0f) {
+            centerX = rightStart - 10.0f - centerW;
+        }
+        if (centerX < leftEnd + 8.0f) {
+            centerX = leftEnd + 8.0f;
+        }
+    }
+
+    L->segDir        = (XSCRectF){ centerX, btnY, dirW, btnH };
+    L->segDirLTR     = (XSCRectF){ centerX + 2.0f, btnY + 2.0f, dirW * 0.5f - 2.0f, btnH - 4.0f };
+    L->segDirRTL     = (XSCRectF){ centerX + dirW * 0.5f, btnY + 2.0f, dirW * 0.5f - 2.0f, btnH - 4.0f };
+
+    float modeX = centerX + dirW + gap;
+    L->segMode       = (XSCRectF){ modeX, btnY, modeW, btnH };
+    L->segModeSingle = (XSCRectF){ modeX + 2.0f, btnY + 2.0f, modeW * 0.5f - 2.0f, btnH - 4.0f };
+    L->segModeDouble = (XSCRectF){ modeX + modeW * 0.5f, btnY + 2.0f, modeW * 0.5f - 2.0f, btnH - 4.0f };
+
+    float indX = modeX + modeW + gap;
+    L->btnPageIndicator = (XSCRectF){ indX, btnY, indW, btnH };
+
+    if (!L->compactMode) {
+        float titleX = leftEnd + 14.0f;
+        float titleW = centerX - titleX - 14.0f;
+        L->titleRect = (XSCRectF){ titleX, 0.0f, titleW > 0.0f ? titleW : 0.0f, tbH };
+    }
+
+    // Sidebar & Canvas
+    if (showSidebar) {
+        L->sidebar     = (XSCRectF){ 0.0f, tbH, kXSCSidebarWidth, fmaxf(0.0f, L->winH - tbH) };
+        L->sidebarList = (XSCRectF){ 0.0f, tbH + kXSCSidebarHeaderH, kXSCSidebarWidth,
+                                     fmaxf(0.0f, L->winH - tbH - kXSCSidebarHeaderH) };
+        L->canvas      = (XSCRectF){ kXSCSidebarWidth + 1.0f, tbH,
+                                     fmaxf(1.0f, L->winW - kXSCSidebarWidth - 1.0f),
+                                     fmaxf(1.0f, L->winH - tbH) };
+    } else {
+        L->canvas = (XSCRectF){ 0.0f, tbH, L->winW, fmaxf(1.0f, L->winH - tbH) };
+    }
+
+    // Empty-state hero card centered inside canvas
+    float ecW = fmaxf(240.0f, fminf(448.0f, L->canvas.width - 32.0f));
+    float ecH = 264.0f;
+    float ecY = floorf(L->canvas.y + (L->canvas.height - ecH) * 0.5f);
+    if (ecY < L->canvas.y + 12.0f) ecY = L->canvas.y + 12.0f;
+    L->emptyCard = (XSCRectF){
+        floorf(L->canvas.x + (L->canvas.width - ecW) * 0.5f),
+        ecY,
+        ecW, ecH
+    };
+    float emptyBtnW = fminf(188.0f, ecW - 32.0f);
+    L->emptyOpenBtn = (XSCRectF){
+        floorf(L->emptyCard.x + (ecW - emptyBtnW) * 0.5f),
+        L->emptyCard.y + 166.0f,
+        emptyBtnW, 38.0f
+    };
+
+    // Page Jump modal centered in window
+    float jW = fmaxf(240.0f, fminf(340.0f, L->winW - 24.0f));
+    float jH = 166.0f;
+    L->jumpCard = (XSCRectF){
+        floorf((L->winW - jW) * 0.5f),
+        fmaxf(tbH + 12.0f, floorf((L->winH - jH) * 0.5f) - 18.0f),
+        jW, jH
+    };
+    L->jumpInput = (XSCRectF){ L->jumpCard.x + 22.0f, L->jumpCard.y + 56.0f, jW - 44.0f, 38.0f };
+    L->jumpGoBtn = (XSCRectF){ L->jumpCard.x + jW - 22.0f - 84.0f, L->jumpCard.y + 114.0f, 84.0f, 32.0f };
+    L->jumpCancelBtn = (XSCRectF){ L->jumpGoBtn.x - 10.0f - 80.0f, L->jumpCard.y + 114.0f, 80.0f, 32.0f };
+
+    // Settings popover anchored beneath right Prefs button
+    float sW = fmaxf(260.0f, fminf(346.0f, L->winW - 24.0f));
+    float sH = 146.0f;
+    L->settingsCard = (XSCRectF){
+        fmaxf(12.0f, L->winW - sW - 12.0f),
+        tbH + 8.0f,
+        sW, sH
+    };
+    L->settingsRowSwapRTL  = (XSCRectF){ L->settingsCard.x + 10.0f, L->settingsCard.y + 48.0f, sW - 20.0f, 40.0f };
+    L->settingsRowContinue = (XSCRectF){ L->settingsCard.x + 10.0f, L->settingsCard.y + 92.0f, sW - 20.0f, 40.0f };
+
+    // Error banner at top-center of canvas
+    float ebW = fmaxf(200.0f, fminf(520.0f, L->canvas.width - 32.0f));
+    L->errorBanner = (XSCRectF){
+        floorf(L->canvas.x + (L->canvas.width - ebW) * 0.5f),
+        L->canvas.y + 14.0f,
+        ebW, 38.0f
+    };
+    L->errorDismissBtn = (XSCRectF){
+        L->errorBanner.x + L->errorBanner.width - 32.0f,
+        L->errorBanner.y + 7.0f,
+        24.0f, 24.0f
+    };
+}
+
+#pragma mark - Native File Dialog
+
+extern char **environ;
+
+static int xsc_spawn_file_picker(pid_t *pid, int *readFd) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return errno;
+    defer {
+        if (fds[0] >= 0) close(fds[0]);
+        close(fds[1]);
+    }
+    if (fcntl(fds[0], F_SETFL, O_NONBLOCK) != 0) return errno;
+
+    posix_spawn_file_actions_t actions;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) return rc;
+    defer { posix_spawn_file_actions_destroy(&actions); }
+
+    rc = posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    if (rc != 0) return rc;
+    rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    if (rc != 0) return rc;
+
+    const char *hostLibrary = getenv("XSCOMIC_HOST_LIBRARY_DIR");
+    const char *directory = (hostLibrary && hostLibrary[0] != '\0') ? "/comics/" : "./";
+    char initialDirectory[32];
+    snprintf(initialDirectory, sizeof(initialDirectory), "--filename=%s", directory);
+    char *zenity[] = { "zenity", "--file-selection", "--title=Open Comic Book",
+        "--file-filter=Comic Archives | *.cbz *.cbr *.cb7 *.cbt *.zip *.rar *.7z *.tar",
+        "--file-filter=All Files | *", initialDirectory, NULL };
+    char *kdialog[] = { "kdialog", "--getopenfilename", (char *)directory,
+        "*.cbz *.cbr *.cb7 *.cbt *.zip *.rar *.7z *.tar|Comic Archives", NULL };
+    rc = posix_spawnp(pid, zenity[0], &actions, NULL, zenity, environ);
+    if (rc == ENOENT || rc == EACCES) {
+        rc = posix_spawnp(pid, kdialog[0], &actions, NULL, kdialog, environ);
+    }
+    if (rc == 0) {
+        *readFd = fds[0];
+        fds[0] = -1;
+    }
+    return rc;
+}
+
+static XSCString *xsc_map_dropped_path(const char *path) {
+    const char *hosts[] = { getenv("XSCOMIC_HOST_CHECKOUT"), getenv("XSCOMIC_HOST_LIBRARY_DIR") };
+    const char *containers[] = { "/work", "/comics" };
+    for (size_t i = 0u; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
+        const char *prefix = hosts[i];
+        if (!prefix || !prefix[0]) continue;
+        size_t length = strlen(prefix);
+        if (length == 1u && prefix[0] == '/' && path[0] == '/') {
+            return [XSCString stringWithFormat:"%s%s", containers[i], path];
+        }
+        if (strncmp(path, prefix, length) == 0 && (path[length] == '/' || path[length] == '\0')) {
+            return [XSCString stringWithFormat:"%s%s", containers[i], path + length];
+        }
+    }
+    return [XSCString stringWithUTF8:path];
+}
+
+typedef enum {
+    XSCScreenshotWaiting,
+    XSCScreenshotReady,
+    XSCScreenshotFailed,
+} XSCScreenshotState;
+
+#pragma mark - Main App Controller
+
+static Uint32 gWakeupEventType = (Uint32)-1;
+
+static void xsc_sdl_wakeup(void) {
+    if (gWakeupEventType != (Uint32)-1) {
+        SDL_Event ev;
+        SDL_zero(ev);
+        ev.type = gWakeupEventType;
+        SDL_PushEvent(&ev);
+    }
+}
+
+@interface XSCAppController : XSCObject <XSCReaderModelDelegate>
+
+@property (nonatomic, readonly) bool shouldQuit;
+@property (nonatomic, readonly) bool needsRedraw;
+
+- (instancetype)initWithWindow:(SDL_Window *)window
+                         model:(XSCReaderModel *)model
+                        canvas:(XSCGLCanvas *)canvas
+                            ui:(XSCUIRenderer *)ui
+                       options:(const XSCCLIOptions *)opts;
+
+- (void)handleSDLEvent:(const SDL_Event *)ev;
+- (void)tickAtMs:(uint64_t)nowMs;
+- (int)eventWaitAtMs:(uint64_t)nowMs;
+- (void)renderFrame;
+- (XSCScreenshotState)screenshotState;
+- (XSCString *)screenshotError;
+- (void)closeFilePicker;
+- (bool)captureScreenshotToPath:(const char *)path;
+
+@end
+
+@implementation XSCAppController {
+    SDL_Window *_window;
+    XSCReaderModel *_model;
+    XSCGLCanvas *_canvas;
+    XSCUIRenderer *_ui;
+    XSCCLIOptions _opts;
+    XSCPrefs _prefs;
+
+    XSCLayout _layout;
+    int _winW;
+    int _winH;
+    int _drawableW;
+    int _drawableH;
+    float _backingScale;
+
+    bool _showsSidebar;
+    float _sidebarScrollY;
+    uint64_t _lastBookID;
+    size_t _lastIndex;
+
+    bool _showJumpModal;
+    char _jumpBuf[16];
+    size_t _jumpLen;
+    bool _jumpSelectAll;
+    bool _jumpInvalid;
+    bool _jumpCaretVisible;
+    uint64_t _jumpBlinkOriginMs;
+
+    bool _showSettings;
+    XSCString *_errorBanner;
+    XSCString *_lastModelError;
+    XSCString *_lastWindowTitle;
+
+    // Hover & drag state
+    float _mouseX;
+    float _mouseY;
+    bool _wasInChrome;
+    bool _isDraggingCanvas;
+    float _lastDragX;
+    float _lastDragY;
+    pid_t _filePickerPID;
+    int _filePickerReadFd;
+    size_t _filePickerLength;
+    char _filePickerPath[PATH_MAX];
+
+    // Zoom label cache
+    char _zoomLabel[24];
+
+    // Lifecycle & screenshot readiness
+    bool _shouldQuit;
+    bool _needsRedraw;
+    bool _hasDisplayedPage;
+    bool _hasDisplayedStatus;
+    bool _cliPostOpenApplied;
+    bool _waitingPostJump;
+
+}
+
+- (bool)shouldQuit { return _shouldQuit; }
+- (bool)needsRedraw { return _needsRedraw; }
+
+- (instancetype)initWithWindow:(SDL_Window *)window
+                         model:(XSCReaderModel *)model
+                        canvas:(XSCGLCanvas *)canvas
+                            ui:(XSCUIRenderer *)ui
+                       options:(const XSCCLIOptions *)opts {
+    self = [super init];
+    if (self) {
+        _window = window;
+        _model = model;
+        _canvas = canvas;
+        _ui = ui;
+        if (opts) _opts = *opts;
+
+        xsc_prefs_load(&_prefs);
+        _showsSidebar = _opts.startSidebar;
+        _showSettings = _opts.startSettings;
+        _mouseX = -1.0f;
+        _mouseY = -1.0f;
+        _needsRedraw = true;
+        _filePickerReadFd = -1;
+        snprintf(_zoomLabel, sizeof(_zoomLabel), "Fit");
+
+        __weak XSCAppController *weakSelf = self;
+        _canvas.onZoomChanged = ^(XSCZoomMode mode, float effectiveScale) {
+            XSCAppController *strongSelf = weakSelf;
+            if (strongSelf) {
+                [strongSelf updateZoomLabelForMode:mode scale:effectiveScale];
+                strongSelf->_needsRedraw = true;
+            }
+        };
+
+        [self syncWindowMetrics];
+
+        // Apply initial reading mode & direction CLI flags before opening book.
+        if (_opts.startDir == 1 && _model.direction != XSCReadingDirectionRTL) {
+            [_model toggleDirection];
+        } else if (_opts.startDir == 0 && _model.direction != XSCReadingDirectionLTR) {
+            [_model toggleDirection];
+        }
+        if (_opts.startMode == 1 && _model.pageMode != XSCPageModeDouble) {
+            [_model togglePageMode];
+        } else if (_opts.startMode == 0 && _model.pageMode != XSCPageModeSingle) {
+            [_model togglePageMode];
+        }
+
+        _model.delegate = self;
+
+        if (_opts.bookPath && _opts.bookPath[0] != '\0') {
+            [_model openPath:_opts.bookPath];
+        } else {
+            if (_opts.startJumpModal) {
+                [self openJumpModal];
+            }
+            if (_opts.startZoom > 0.0f) {
+                [_canvas setCustomScale:_opts.startZoom];
+            }
+        }
+    }
+    return self;
+}
+
+- (void)syncWindowMetrics {
+    int ww = kXSCDefaultWindowW, wh = kXSCDefaultWindowH;
+    int dw = kXSCDefaultWindowW, dh = kXSCDefaultWindowH;
+    SDL_GetWindowSize(_window, &ww, &wh);
+    SDL_GL_GetDrawableSize(_window, &dw, &dh);
+    _winW = ww > 0 ? ww : 1;
+    _winH = wh > 0 ? wh : 1;
+    _drawableW = dw > 0 ? dw : _winW;
+    _drawableH = dh > 0 ? dh : _winH;
+    _backingScale = (float)_drawableW / (float)_winW;
+    if (_backingScale < 0.5f) _backingScale = 1.0f;
+
+    xsc_compute_layout(&_layout, (float)_winW, (float)_winH, _showsSidebar);
+    [_canvas setViewportRect:_layout.canvas
+               drawableWidth:_drawableW
+              drawableHeight:_drawableH
+                backingScale:_backingScale];
+    [self clampSidebarScroll];
+}
+
+- (void)updateZoomLabelForMode:(XSCZoomMode)mode scale:(float)scale {
+    if (mode == XSCZoomModeFit) {
+        snprintf(_zoomLabel, sizeof(_zoomLabel), "Fit");
+    } else {
+        long pct = lrintf(scale * 100.0f);
+        if (pct == 100L) {
+            snprintf(_zoomLabel, sizeof(_zoomLabel), "1:1");
+        } else {
+            snprintf(_zoomLabel, sizeof(_zoomLabel), "%ld%%", pct);
+        }
+    }
+}
+
+- (void)clampSidebarScroll {
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    size_t count = book ? book.pageCount : 0u;
+    float contentH = (float)count * kXSCSidebarRowH + 12.0f;
+    float maxScroll = fmaxf(0.0f, contentH - _layout.sidebarList.height);
+    if (_sidebarScrollY < 0.0f) _sidebarScrollY = 0.0f;
+    if (_sidebarScrollY > maxScroll) _sidebarScrollY = maxScroll;
+}
+
+- (void)scrollSidebarToCurrentPage {
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    if (!book || book.pageCount == 0u) return;
+    float rowTop = (float)_model.currentIndex * kXSCSidebarRowH + 6.0f;
+    float rowBot = rowTop + kXSCSidebarRowH;
+    float viewH = _layout.sidebarList.height;
+    if (rowTop < _sidebarScrollY) {
+        _sidebarScrollY = rowTop - 6.0f;
+    } else if (rowBot > _sidebarScrollY + viewH) {
+        _sidebarScrollY = rowBot - viewH + 6.0f;
+    }
+    [self clampSidebarScroll];
+}
+
+#pragma mark - Actions
+
+- (void)toggleSidebar {
+    _showsSidebar = !_showsSidebar;
+    [self syncWindowMetrics];
+    if (_showsSidebar) {
+        [self scrollSidebarToCurrentPage];
+    }
+    _needsRedraw = true;
+}
+
+- (void)openJumpModal {
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    _showSettings = false;
+    _showJumpModal = true;
+    _jumpInvalid = false;
+    _jumpBlinkOriginMs = (uint64_t)xsc_now_ms();
+    if (book && book.pageCount > 0u) {
+        int n = snprintf(_jumpBuf, sizeof(_jumpBuf), "%zu", _model.currentIndex + 1u);
+        _jumpLen = (n > 0) ? (size_t)n : 0u;
+    } else {
+        _jumpBuf[0] = '\0';
+        _jumpLen = 0u;
+    }
+    _jumpSelectAll = (_jumpLen > 0u);
+    SDL_StartTextInput();
+    _needsRedraw = true;
+}
+
+- (void)closeJumpModal {
+    if (!_showJumpModal) return;
+    _showJumpModal = false;
+    _jumpSelectAll = false;
+    _jumpInvalid = false;
+    SDL_StopTextInput();
+    _needsRedraw = true;
+}
+
+- (void)commitJumpModal {
+    if (_jumpLen == 0u) {
+        _jumpInvalid = true;
+        _needsRedraw = true;
+        return;
+    }
+    errno = 0;
+    char *endPtr = NULL;
+    long long val = strtoll(_jumpBuf, &endPtr, 10);
+    if (errno == 0 && endPtr && endPtr != _jumpBuf && *endPtr == '\0'
+        && val >= 1 && [_model jumpToOneBasedPageNumber:(int64_t)val]) {
+        [self closeJumpModal];
+    } else {
+        _jumpInvalid = true;
+        _jumpSelectAll = false;
+        _needsRedraw = true;
+    }
+}
+
+- (void)toggleSettings {
+    if (_showJumpModal) [self closeJumpModal];
+    _showSettings = !_showSettings;
+    _needsRedraw = true;
+}
+
+- (void)chooseBookInteractive {
+    if (_filePickerPID > 0) return;
+    int rc = xsc_spawn_file_picker(&_filePickerPID, &_filePickerReadFd);
+    if (rc != 0) {
+        _filePickerPID = 0;
+        _errorBanner = rc == ENOENT
+            ? [XSCString stringWithUTF8:"Install zenity or kdialog to browse files, or drag a comic here."]
+            : [XSCString stringWithFormat:"Could not open the file picker: %s", strerror(rc)];
+        _needsRedraw = true;
+    }
+}
+
+- (void)closeFilePicker {
+    if (_filePickerPID <= 0) return;
+    close(_filePickerReadFd);
+    (void)kill(_filePickerPID, SIGKILL);
+    while (waitpid(_filePickerPID, NULL, 0) < 0 && errno == EINTR) {}
+    _filePickerPID = 0;
+    _filePickerReadFd = -1;
+    _filePickerLength = 0u;
+}
+
+- (void)pollFilePicker {
+    if (_filePickerPID <= 0) return;
+    while (_filePickerLength < sizeof(_filePickerPath)) {
+        ssize_t n = read(_filePickerReadFd, _filePickerPath + _filePickerLength,
+                         sizeof(_filePickerPath) - _filePickerLength);
+        if (n > 0) {
+            _filePickerLength += (size_t)n;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            [self closeFilePicker];
+            return;
+        }
+    }
+    // At most PATH_MAX - 1 path bytes and the picker's trailing newline.
+    char extra;
+    if (_filePickerLength == sizeof(_filePickerPath)) {
+        ssize_t n = read(_filePickerReadFd, &extra, 1u);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (n != 0 || _filePickerPath[_filePickerLength - 1u] != '\n') {
+            [self closeFilePicker];
+            _errorBanner = [XSCString stringWithUTF8:"The selected path is too long."];
+            _needsRedraw = true;
+            return;
+        }
+    }
+
+    int status = 0;
+    pid_t pid = waitpid(_filePickerPID, &status, WNOHANG);
+    if (pid == 0 || (pid < 0 && errno == EINTR)) return;
+    close(_filePickerReadFd);
+    _filePickerPID = 0;
+    _filePickerReadFd = -1;
+    size_t length = _filePickerLength;
+    _filePickerLength = 0u;
+    if (pid < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || length == 0u) return;
+    if (_filePickerPath[length - 1u] == '\n') length--;
+    if (length == 0u || memchr(_filePickerPath, '\0', length)) return;
+    _filePickerPath[length] = '\0';
+    _errorBanner = nil;
+    [_model openPath:_filePickerPath];
+}
+
+- (void)toggleZoomFitActual {
+    if (_canvas.zoomMode == XSCZoomModeFit) {
+        [_canvas setCustomScale:1.0f];
+    } else {
+        _isDraggingCanvas = false;
+        [_canvas setFitMode];
+    }
+    _needsRedraw = true;
+}
+
+#pragma mark - XSCReaderModelDelegate
+
+- (void)readerModelDidUpdateState:(XSCReaderModel *)model {
+    XSCBook *book = xsc_unwrap_book(model.book);
+    XSCString *nextTitle = (book && book.displayTitle.length > 0u)
+        ? [XSCString stringWithFormat:"%s \xE2\x80\x94 xsComic", book.displayTitle.utf8]
+        : [XSCString stringWithUTF8:"xsComic"];
+    if (!_lastWindowTitle || ![nextTitle isEqualToString:_lastWindowTitle]) {
+        _lastWindowTitle = nextTitle;
+        SDL_SetWindowTitle(_window, nextTitle.utf8);
+    }
+
+    uint64_t bookID = book ? book.bookID : 0ULL;
+    bool bookChanged = (bookID != _lastBookID);
+    bool indexChanged = (model.currentIndex != _lastIndex);
+
+    if (bookChanged) {
+        _lastBookID = bookID;
+        _sidebarScrollY = 0.0f;
+        _hasDisplayedPage = false;
+        _hasDisplayedStatus = false;
+        if (_showJumpModal && !_opts.startJumpModal) {
+            [self closeJumpModal];
+        }
+    }
+    if (bookChanged || indexChanged) {
+        _lastIndex = model.currentIndex;
+        [_canvas resetPan];
+        [self clampSidebarScroll];
+        if (_showsSidebar) {
+            [self scrollSidebarToCurrentPage];
+        }
+    }
+
+    XSCString *errMsg = xsc_unwrap_opt_string(model.errorMessage);
+    if (errMsg && (!(_lastModelError && [errMsg isEqualToString:_lastModelError]))) {
+        _lastModelError = errMsg;
+        _errorBanner = errMsg;
+    } else if (!errMsg && _lastModelError != nil) {
+        if (_errorBanner && [_errorBanner isEqualToString:_lastModelError]) {
+            _errorBanner = nil;
+        }
+        _lastModelError = nil;
+    }
+
+    // Apply CLI post-open overrides once the book finishes loading.
+    if (book && !model.isLoading && !_cliPostOpenApplied) {
+        _cliPostOpenApplied = true;
+        if (_opts.startPage > 0 && (uint64_t)_opts.startPage > book.pageCount) {
+            _errorBanner = [XSCString stringWithUTF8:"The requested page is outside the book."];
+        } else if (_opts.startPage > 1) {
+            _hasDisplayedPage = false;
+            _hasDisplayedStatus = false;
+            _waitingPostJump = true;
+            if (![_model jumpToOneBasedPageNumber:_opts.startPage]) {
+                _waitingPostJump = false;
+            }
+        }
+        if (_opts.startZoom > 0.0f) {
+            [_canvas setCustomScale:_opts.startZoom];
+        }
+        if (_opts.startJumpModal) {
+            [self openJumpModal];
+        }
+    }
+
+    _needsRedraw = true;
+}
+
+- (void)readerModel:(XSCReaderModel *)model
+    displayLeftPage:(XSCOptDecodedPage)leftPage
+          rightPage:(XSCOptDecodedPage)rightPage
+       showEmptyCTA:(bool)showEmptyCTA
+          isLoading:(bool)isLoading
+         statusText:(XSCOptString)statusText {
+    [_canvas displayLeftPage:leftPage
+                   rightPage:rightPage
+                showEmptyCTA:showEmptyCTA
+                   isLoading:isLoading
+                  statusText:statusText];
+
+    bool hasLeft = xsc_opt_page_has_value(leftPage);
+    bool hasRight = xsc_opt_page_has_value(rightPage);
+    XSCString *st = xsc_unwrap_opt_string(statusText);
+    bool hasStatus = (st != nil && st.length > 0u);
+
+    bool hasCompleteSpread = hasLeft && (model.visualPageIndices.count < 2u || hasRight);
+    _hasDisplayedPage = !isLoading && hasCompleteSpread;
+    _hasDisplayedStatus = !isLoading && (hasStatus || ((hasLeft || hasRight) && !hasCompleteSpread));
+    if (_waitingPostJump && !isLoading && (hasLeft || hasRight || hasStatus)) {
+        _waitingPostJump = false;
+    }
+
+    _needsRedraw = true;
+}
+
+#pragma mark - Input Handling
+
+- (void)handleKeyDown:(const SDL_KeyboardEvent *)kev {
+    SDL_Keycode key = kev->keysym.sym;
+    Uint16 mod = kev->keysym.mod;
+    bool ctrl  = (mod & KMOD_CTRL) != 0;
+    bool shift = (mod & KMOD_SHIFT) != 0;
+    bool alt   = (mod & KMOD_ALT) != 0;
+
+    if (ctrl && key == SDLK_q) {
+        _shouldQuit = true;
+        return;
+    }
+
+    // Modal keyboard capture for Jump-to-Page
+    if (_showJumpModal) {
+        if (key == SDLK_ESCAPE) {
+            [self closeJumpModal];
+            return;
+        }
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+            [self commitJumpModal];
+            return;
+        }
+        if (ctrl && key == SDLK_a) {
+            _jumpSelectAll = (_jumpLen > 0u);
+            _needsRedraw = true;
+            return;
+        }
+        if (key == SDLK_BACKSPACE || key == SDLK_DELETE) {
+            if (_jumpSelectAll || (ctrl && key == SDLK_BACKSPACE)) {
+                _jumpLen = 0u;
+                _jumpBuf[0] = '\0';
+                _jumpSelectAll = false;
+                _jumpInvalid = false;
+                _jumpBlinkOriginMs = (uint64_t)xsc_now_ms();
+                _needsRedraw = true;
+            } else if (key == SDLK_BACKSPACE && _jumpLen > 0u) {
+                _jumpBuf[--_jumpLen] = '\0';
+                _jumpInvalid = false;
+                _jumpBlinkOriginMs = (uint64_t)xsc_now_ms();
+                _needsRedraw = true;
+            }
+            return;
+        }
+        return;
+    }
+
+    if (key == SDLK_ESCAPE) {
+        if (_showSettings) {
+            _showSettings = false;
+            _needsRedraw = true;
+        } else if (_errorBanner) {
+            _errorBanner = nil;
+            _needsRedraw = true;
+        }
+        return;
+    }
+
+    if (ctrl && key == SDLK_o) {
+        [self chooseBookInteractive];
+        return;
+    }
+    if (ctrl && key == SDLK_COMMA) {
+        [self toggleSettings];
+        return;
+    }
+    if ((ctrl && shift && key == SDLK_g) || (!ctrl && !alt && !shift && key == SDLK_g)) {
+        if (xsc_unwrap_book(_model.book) != nil) {
+            [self openJumpModal];
+        }
+        return;
+    }
+    if ((ctrl && alt && key == SDLK_s) || (!ctrl && !alt && !shift && key == SDLK_b)) {
+        [self toggleSidebar];
+        return;
+    }
+    if (!alt && !shift && key == SDLK_d) {
+        [_model toggleDirection];
+        return;
+    }
+    if (!alt && !shift && key == SDLK_p) {
+        [_model togglePageMode];
+        return;
+    }
+    if ((ctrl && (key == SDLK_0 || key == SDLK_KP_0))
+        || (!ctrl && !alt && (key == SDLK_0 || key == SDLK_KP_0 || key == SDLK_f))) {
+        _isDraggingCanvas = false;
+        [_canvas setFitMode];
+        _needsRedraw = true;
+        return;
+    }
+    if ((ctrl && (key == SDLK_1 || key == SDLK_KP_1))
+        || (!ctrl && !alt && (key == SDLK_1 || key == SDLK_KP_1))) {
+        [_canvas setCustomScale:1.0f];
+        _needsRedraw = true;
+        return;
+    }
+    if (!alt && (key == SDLK_PLUS || key == SDLK_EQUALS || key == SDLK_KP_PLUS)) {
+        [_canvas adjustZoomByFactor:1.25f];
+        _needsRedraw = true;
+        return;
+    }
+    if (!alt && (key == SDLK_MINUS || key == SDLK_KP_MINUS)) {
+        [_canvas adjustZoomByFactor:0.8f];
+        _needsRedraw = true;
+        return;
+    }
+
+    if (ctrl || alt) return;
+
+    // Zero-hop page turn fast path
+    switch (key) {
+        case SDLK_LEFT:
+            [_model turnPageForKey:XSCPageTurnKeyLeft
+               swapRTLPageTurnKeys:_prefs.swapRTLPageTurnKeys
+             continueAcrossVolumes:_prefs.continueAcrossVolumes];
+            return;
+        case SDLK_RIGHT:
+            [_model turnPageForKey:XSCPageTurnKeyRight
+               swapRTLPageTurnKeys:_prefs.swapRTLPageTurnKeys
+             continueAcrossVolumes:_prefs.continueAcrossVolumes];
+            return;
+        case SDLK_SPACE:
+            if (shift) {
+                [_model goBackwardContinueAcrossVolumes:_prefs.continueAcrossVolumes];
+            } else {
+                [_model goForwardContinueAcrossVolumes:_prefs.continueAcrossVolumes];
+            }
+            return;
+        case SDLK_PAGEDOWN:
+            [_model goForwardContinueAcrossVolumes:_prefs.continueAcrossVolumes];
+            return;
+        case SDLK_PAGEUP:
+            [_model goBackwardContinueAcrossVolumes:_prefs.continueAcrossVolumes];
+            return;
+        case SDLK_HOME:
+            [_model jumpToOneBasedPageNumber:1];
+            return;
+        case SDLK_END: {
+            XSCBook *book = xsc_unwrap_book(_model.book);
+            if (book && book.pageCount > 0u) {
+                [_model jumpToOneBasedPageNumber:(int64_t)book.pageCount];
+            }
+            return;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)handleTextInput:(const char *)text {
+    if (!_showJumpModal || !text) return;
+    for (size_t i = 0u; text[i] != '\0'; i++) {
+        if (isdigit((unsigned char)text[i])) {
+            if (_jumpSelectAll) {
+                _jumpLen = 0u;
+                _jumpBuf[0] = '\0';
+                _jumpSelectAll = false;
+            }
+            if (_jumpLen + 1u < sizeof(_jumpBuf)) {
+                _jumpBuf[_jumpLen++] = text[i];
+                _jumpBuf[_jumpLen] = '\0';
+                _jumpInvalid = false;
+                _jumpBlinkOriginMs = (uint64_t)xsc_now_ms();
+                _needsRedraw = true;
+            }
+        }
+    }
+}
+
+- (void)handleMouseDownX:(float)x y:(float)y button:(Uint8)button {
+    if (button != SDL_BUTTON_LEFT) return;
+
+    // 1. Jump modal captures all clicks
+    if (_showJumpModal) {
+        if (xsc_pt_in_rect(x, y, _layout.jumpCancelBtn) || !xsc_pt_in_rect(x, y, _layout.jumpCard)) {
+            [self closeJumpModal];
+        } else if (xsc_pt_in_rect(x, y, _layout.jumpGoBtn)) {
+            [self commitJumpModal];
+        } else if (xsc_pt_in_rect(x, y, _layout.jumpInput) && _jumpSelectAll) {
+            _jumpSelectAll = false;
+            _needsRedraw = true;
+        }
+        return;
+    }
+
+    // 2. Settings popover (click outside dismisses and consumes the click)
+    if (_showSettings) {
+        if (xsc_pt_in_rect(x, y, _layout.settingsRowSwapRTL)) {
+            _prefs.swapRTLPageTurnKeys = !_prefs.swapRTLPageTurnKeys;
+            xsc_prefs_save(&_prefs);
+            _needsRedraw = true;
+            return;
+        }
+        if (xsc_pt_in_rect(x, y, _layout.settingsRowContinue)) {
+            _prefs.continueAcrossVolumes = !_prefs.continueAcrossVolumes;
+            xsc_prefs_save(&_prefs);
+            _needsRedraw = true;
+            return;
+        }
+        if (xsc_pt_in_rect(x, y, _layout.settingsCard)) {
+            return;
+        }
+        _showSettings = false;
+        _needsRedraw = true;
+        return;
+    }
+
+    // 3. Error banner dismiss (clicking anywhere on the banner or its close button dismisses it)
+    if (_errorBanner && xsc_pt_in_rect(x, y, _layout.errorBanner)) {
+        _errorBanner = nil;
+        _needsRedraw = true;
+        return;
+    }
+
+    // 4. Top toolbar controls
+    if (xsc_pt_in_rect(x, y, _layout.toolbar)) {
+        if (xsc_pt_in_rect(x, y, _layout.btnSidebar)) {
+            [self toggleSidebar];
+        } else if (xsc_pt_in_rect(x, y, _layout.btnOpen)) {
+            [self chooseBookInteractive];
+        } else if (xsc_pt_in_rect(x, y, _layout.segDirLTR)) {
+            if (_model.direction != XSCReadingDirectionLTR) [_model toggleDirection];
+        } else if (xsc_pt_in_rect(x, y, _layout.segDirRTL)) {
+            if (_model.direction != XSCReadingDirectionRTL) [_model toggleDirection];
+        } else if (xsc_pt_in_rect(x, y, _layout.segModeSingle)) {
+            if (_model.pageMode != XSCPageModeSingle) [_model togglePageMode];
+        } else if (xsc_pt_in_rect(x, y, _layout.segModeDouble)) {
+            if (_model.pageMode != XSCPageModeDouble) [_model togglePageMode];
+        } else if (xsc_pt_in_rect(x, y, _layout.btnPageIndicator)) {
+            if (xsc_unwrap_book(_model.book) != nil) [self openJumpModal];
+        } else if (xsc_pt_in_rect(x, y, _layout.btnZoomOut)) {
+            [_canvas adjustZoomByFactor:0.8f];
+            _needsRedraw = true;
+        } else if (xsc_pt_in_rect(x, y, _layout.btnZoomLabel)) {
+            [self toggleZoomFitActual];
+        } else if (xsc_pt_in_rect(x, y, _layout.btnZoomIn)) {
+            [_canvas adjustZoomByFactor:1.25f];
+            _needsRedraw = true;
+        } else if (xsc_pt_in_rect(x, y, _layout.btnPrefs)) {
+            [self toggleSettings];
+        }
+        return;
+    }
+
+    // 5. Sidebar page selection
+    if (_showsSidebar && xsc_pt_in_rect(x, y, _layout.sidebar)) {
+        if (xsc_pt_in_rect(x, y, _layout.sidebarList)) {
+            XSCBook *book = xsc_unwrap_book(_model.book);
+            if (book && book.pageCount > 0u) {
+                float localY = (y - _layout.sidebarList.y) + _sidebarScrollY - 6.0f;
+                if (localY >= 0.0f) {
+                    size_t row = (size_t)(localY / kXSCSidebarRowH);
+                    if (row < book.pageCount) {
+                        [_model jumpToOneBasedPageNumber:(int64_t)(row + 1u)];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // 6. Empty-state CTA button
+    if (_canvas.showEmptyCTA && !_canvas.isLoading && xsc_pt_in_rect(x, y, _layout.emptyOpenBtn)) {
+        [self chooseBookInteractive];
+        return;
+    }
+
+    // 7. Drag-to-pan on canvas when zoomed
+    if (xsc_pt_in_rect(x, y, _layout.canvas) && _canvas.zoomMode == XSCZoomModeCustom) {
+        _isDraggingCanvas = true;
+        _lastDragX = x;
+        _lastDragY = y;
+    }
+}
+
+- (void)handleMouseWheel:(const SDL_MouseWheelEvent *)wev {
+    if (_showJumpModal || _showSettings) return;
+
+    float ptrX = (float)wev->mouseX;
+    float ptrY = (float)wev->mouseY;
+
+    float wx = wev->preciseX;
+    float wy = wev->preciseY;
+    if (wx == 0.0f && wev->x != 0) wx = (float)wev->x;
+    if (wy == 0.0f && wev->y != 0) wy = (float)wev->y;
+    if (wev->direction == SDL_MOUSEWHEEL_FLIPPED) {
+        wx = -wx;
+        wy = -wy;
+    }
+
+    if (_showsSidebar && xsc_pt_in_rect(ptrX, ptrY, _layout.sidebar)) {
+        _sidebarScrollY -= wy * 48.0f;
+        [self clampSidebarScroll];
+        _needsRedraw = true;
+        return;
+    }
+
+    if (xsc_pt_in_rect(ptrX, ptrY, _layout.canvas)) {
+        bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
+        if (ctrl) {
+            float clampedWy = fminf(12.0f, fmaxf(-12.0f, wy));
+            float factor = powf(1.12f, clampedWy);
+            float localX = ptrX - _layout.canvas.x;
+            float localY = ptrY - _layout.canvas.y;
+            [_canvas zoomAroundPointX:localX y:localY factor:factor];
+            _needsRedraw = true;
+        } else if (_canvas.zoomMode == XSCZoomModeCustom) {
+            [_canvas panByDeltaX:(-wx * 40.0f) deltaY:(wy * 40.0f)];
+            _needsRedraw = true;
+        }
+    }
+}
+
+- (void)handleSDLEvent:(const SDL_Event *)ev {
+    switch (ev->type) {
+        case SDL_QUIT:
+            _shouldQuit = true;
+            break;
+
+        case SDL_WINDOWEVENT:
+            if (ev->window.event == SDL_WINDOWEVENT_SIZE_CHANGED
+                || ev->window.event == SDL_WINDOWEVENT_RESIZED
+                || ev->window.event == SDL_WINDOWEVENT_EXPOSED
+                || ev->window.event == SDL_WINDOWEVENT_MAXIMIZED
+                || ev->window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED
+                || ev->window.event == SDL_WINDOWEVENT_RESTORED) {
+                [self syncWindowMetrics];
+                _needsRedraw = true;
+            } else if (ev->window.event == SDL_WINDOWEVENT_LEAVE) {
+                _mouseX = -1.0f;
+                _mouseY = -1.0f;
+                if (_wasInChrome) {
+                    _wasInChrome = false;
+                    _needsRedraw = true;
+                }
+            } else if (ev->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                _isDraggingCanvas = false;
+            }
+            break;
+
+        case SDL_KEYDOWN:
+            [self handleKeyDown:&ev->key];
+            break;
+
+        case SDL_TEXTINPUT:
+            [self handleTextInput:ev->text.text];
+            break;
+
+        case SDL_MOUSEMOTION: {
+            float nx = (float)ev->motion.x;
+            float ny = (float)ev->motion.y;
+            if (_isDraggingCanvas) {
+                [_canvas panByDeltaX:(nx - _lastDragX) deltaY:(ny - _lastDragY)];
+                _lastDragX = nx;
+                _lastDragY = ny;
+                _needsRedraw = true;
+            } else {
+                // Repaint on hover over chrome/overlays (plus one exit frame to clear hover).
+                bool inChrome = (ny <= kXSCToolbarHeight + 2.0f)
+                    || (_showsSidebar && nx <= kXSCSidebarWidth + 2.0f)
+                    || _showSettings || _showJumpModal || _canvas.showEmptyCTA || (_errorBanner != nil);
+                if (inChrome || _wasInChrome) {
+                    _needsRedraw = true;
+                }
+                _wasInChrome = inChrome;
+            }
+            _mouseX = nx;
+            _mouseY = ny;
+            break;
+        }
+
+        case SDL_MOUSEBUTTONDOWN:
+            _mouseX = (float)ev->button.x;
+            _mouseY = (float)ev->button.y;
+            [self handleMouseDownX:_mouseX y:_mouseY button:ev->button.button];
+            break;
+
+        case SDL_MOUSEBUTTONUP:
+            if (ev->button.button == SDL_BUTTON_LEFT) {
+                _isDraggingCanvas = false;
+            }
+            break;
+
+        case SDL_MOUSEWHEEL:
+            [self handleMouseWheel:&ev->wheel];
+            break;
+
+        case SDL_MULTIGESTURE: {
+            float x = ev->mgesture.x * (float)_winW;
+            float y = ev->mgesture.y * (float)_winH;
+            if (!_showJumpModal && !_showSettings && fabsf(ev->mgesture.dDist) > 1e-4f &&
+                xsc_pt_in_rect(x, y, _layout.canvas)) {
+                float factor = expf(fminf(1.0f, fmaxf(-1.0f, ev->mgesture.dDist * 4.0f)));
+                [_canvas zoomAroundPointX:x - _layout.canvas.x y:y - _layout.canvas.y factor:factor];
+                _needsRedraw = true;
+            }
+            break;
+        }
+
+        case SDL_DROPFILE: {
+            char *dropped = ev->drop.file;
+            if (dropped) {
+                defer { SDL_free(dropped); }
+                if (dropped[0] != '\0') {
+                    [self closeFilePicker];
+                    _errorBanner = nil;
+                    XSCString *path = xsc_map_dropped_path(dropped);
+                    [_model openPath:path.utf8];
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static const uint64_t kXSCCaretHalfPeriodMs = 530u;
+
+- (void)tickAtMs:(uint64_t)nowMs {
+    [self pollFilePicker];
+    if (xsc_main_drain() > 0u) {
+        _needsRedraw = true;
+    }
+    if ([_canvas tickAnimationAtMs:nowMs]) {
+        _needsRedraw = true;
+    }
+    if (_showJumpModal) {
+        uint64_t elapsed = nowMs >= _jumpBlinkOriginMs ? nowMs - _jumpBlinkOriginMs : 0u;
+        bool visible = (elapsed / kXSCCaretHalfPeriodMs) % 2u == 0u;
+        if (visible != _jumpCaretVisible) {
+            _jumpCaretVisible = visible;
+            _needsRedraw = true;
+        }
+    }
+}
+
+- (int)eventWaitAtMs:(uint64_t)nowMs {
+    // The main queue sends an SDL event. Only the picker pipe needs polling,
+    // with a slow fallback for an unavailable SDL wakeup event.
+    uint64_t wait = (_filePickerPID > 0 || gWakeupEventType == (Uint32)-1) ? 50u : 1000u;
+    uint64_t animation = [_canvas nextAnimationDeadlineMs];
+    uint64_t work = xsc_main_next_deadline_ms();
+    uint64_t deadline = work < animation ? work : animation;
+    uint64_t untilDeadline = deadline > nowMs ? deadline - nowMs : 0u;
+    if (untilDeadline < wait) wait = untilDeadline;
+    if (_showJumpModal) {
+        uint64_t elapsed = nowMs >= _jumpBlinkOriginMs ? nowMs - _jumpBlinkOriginMs : 0u;
+        bool visible = (elapsed / kXSCCaretHalfPeriodMs) % 2u == 0u;
+        if (visible != _jumpCaretVisible) return 0;
+        uint64_t untilBlink = kXSCCaretHalfPeriodMs - elapsed % kXSCCaretHalfPeriodMs;
+        if (untilBlink < wait) wait = untilBlink;
+    }
+    return (int)wait;
+}
+
+#pragma mark - Chrome & Overlay Rendering
+
+- (void)drawToolbarFull {
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    float textH13 = [ui fontHeight:XSCFontRegular13];
+    bool canHover = !_showJumpModal && !_showSettings;
+
+    // Toolbar surface + bottom divider
+    [ui drawRect:L->toolbar fill:kColChromeBg];
+    [ui drawRect:(XSCRectF){ 0.0f, L->toolbar.height - 1.0f, L->winW, 1.0f } fill:kColBorder];
+
+    // [Sidebar] toggle button
+    bool hovSidebar = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnSidebar);
+    XSCColor sbFill   = _showsSidebar ? kColAccentTint : (hovSidebar ? kColHoverFill : kColClear);
+    XSCColor sbBorder = _showsSidebar ? kColAccentBorder : (hovSidebar ? kColBorderStrong : kColClear);
+    XSCColor sbIcon   = _showsSidebar ? kColAccent : (hovSidebar ? kColTextPrimary : kColTextSecondary);
+    [ui drawRoundedRect:L->btnSidebar radius:6.0f fill:sbFill border:sbBorder borderWidth:1.0f];
+    xsc_draw_sidebar_icon(ui, L->btnSidebar, sbIcon);
+
+    // [Open] button (full icon+label at >=560px; icon-only if forced narrower)
+    bool hovOpen = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnOpen);
+    [ui drawRoundedRect:L->btnOpen
+                 radius:6.0f
+                   fill:(hovOpen ? kColHoverFill : kColBtnFill)
+                 border:(hovOpen ? kColBorderStrong : kColBorder)
+            borderWidth:1.0f];
+    if (L->compactOpen) {
+        float fx = floorf(L->btnOpen.x + (L->btnOpen.width - 13.0f) * 0.5f);
+        xsc_draw_folder_icon(ui, fx, L->btnOpen.y + 8.5f, hovOpen ? kColTextPrimary : kColTextSecondary);
+    } else {
+        float openContentW = 13.0f + 6.0f + [ui measureTextWidth:"Open" font:XSCFontRegular13];
+        float openStartX = floorf(L->btnOpen.x + (L->btnOpen.width - openContentW) * 0.5f);
+        xsc_draw_folder_icon(ui, openStartX, L->btnOpen.y + 8.5f, hovOpen ? kColTextPrimary : kColTextSecondary);
+        [ui drawText:"Open"
+                font:XSCFontRegular13
+                   x:openStartX + 19.0f
+                   y:L->btnOpen.y + (L->btnOpen.height - textH13) * 0.5f
+               color:kColTextPrimary];
+    }
+
+    // Book title (left-aligned between Open and center controls when wide enough)
+    if (!L->compactMode && L->titleRect.width >= 72.0f) {
+        const char *titleStr = (book && book.displayTitle.length > 0u) ? book.displayTitle.utf8 : "xsComic";
+        XSCFontSlot titleFont = book ? XSCFontBold13 : XSCFontRegular13;
+        XSCColor titleCol = book ? kColTextPrimary : kColTextMuted;
+        float th = [ui fontHeight:titleFont];
+        [ui drawTextEllipsized:titleStr
+                          font:titleFont
+                             x:L->titleRect.x
+                             y:(L->toolbar.height - th) * 0.5f
+                      maxWidth:L->titleRect.width
+                         color:titleCol];
+    }
+
+    // [LTR | RTL] segmented control
+    [ui drawRoundedRect:L->segDir radius:7.0f fill:kColTroughBg border:kColBorder borderWidth:1.0f];
+    bool isRTL = (_model.direction == XSCReadingDirectionRTL);
+    bool hovLTR = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->segDirLTR);
+    bool hovRTL = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->segDirRTL);
+    if (!isRTL) {
+        [ui drawRoundedRect:L->segDirLTR radius:5.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+    } else if (hovLTR) {
+        [ui drawRoundedRect:L->segDirLTR radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    if (isRTL) {
+        [ui drawRoundedRect:L->segDirRTL radius:5.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+    } else if (hovRTL) {
+        [ui drawRoundedRect:L->segDirRTL radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    [ui drawTextCentered:"LTR"
+                    font:(!isRTL ? XSCFontBold13 : XSCFontRegular13)
+                  inRect:L->segDirLTR
+                   color:(!isRTL ? kColTextWhite : (hovLTR ? kColTextPrimary : kColTextSecondary))];
+    [ui drawTextCentered:"RTL"
+                    font:(isRTL ? XSCFontBold13 : XSCFontRegular13)
+                  inRect:L->segDirRTL
+                   color:(isRTL ? kColTextWhite : (hovRTL ? kColTextPrimary : kColTextSecondary))];
+
+    // [Single | Spread] segmented control (icons + text when wide, crisp icon-only in compact mode)
+    [ui drawRoundedRect:L->segMode radius:7.0f fill:kColTroughBg border:kColBorder borderWidth:1.0f];
+    bool isDbl = (_model.pageMode == XSCPageModeDouble);
+    bool hovSingle = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->segModeSingle);
+    bool hovDouble = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->segModeDouble);
+    if (!isDbl) {
+        [ui drawRoundedRect:L->segModeSingle radius:5.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+    } else if (hovSingle) {
+        [ui drawRoundedRect:L->segModeSingle radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    if (isDbl) {
+        [ui drawRoundedRect:L->segModeDouble radius:5.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+    } else if (hovDouble) {
+        [ui drawRoundedRect:L->segModeDouble radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    XSCColor singleCol = !isDbl ? kColTextWhite : (hovSingle ? kColTextPrimary : kColTextSecondary);
+    XSCColor doubleCol =  isDbl ? kColTextWhite : (hovDouble ? kColTextPrimary : kColTextSecondary);
+    if (L->compactMode) {
+        float sx = floorf(L->segModeSingle.x + (L->segModeSingle.width - 8.0f) * 0.5f);
+        float dx = floorf(L->segModeDouble.x + (L->segModeDouble.width - 14.0f) * 0.5f);
+        xsc_draw_single_icon(ui, sx, L->segModeSingle.y + 6.5f, singleCol);
+        xsc_draw_spread_icon(ui, dx, L->segModeDouble.y + 6.5f, doubleCol);
+    } else {
+        XSCFontSlot singleFont = !isDbl ? XSCFontBold13 : XSCFontRegular13;
+        XSCFontSlot doubleFont =  isDbl ? XSCFontBold13 : XSCFontRegular13;
+        float singleContentW = 8.0f + 6.0f + [ui measureTextWidth:"Single" font:singleFont];
+        float singleStartX = floorf(L->segModeSingle.x + (L->segModeSingle.width - singleContentW) * 0.5f);
+        xsc_draw_single_icon(ui, singleStartX, L->segModeSingle.y + 6.5f, singleCol);
+        [ui drawText:"Single"
+                font:singleFont
+                   x:singleStartX + 14.0f
+                   y:L->segModeSingle.y + (L->segModeSingle.height - textH13) * 0.5f
+               color:singleCol];
+        float doubleContentW = 14.0f + 5.0f + [ui measureTextWidth:"Spread" font:doubleFont];
+        float doubleStartX = floorf(L->segModeDouble.x + (L->segModeDouble.width - doubleContentW) * 0.5f);
+        xsc_draw_spread_icon(ui, doubleStartX, L->segModeDouble.y + 6.5f, doubleCol);
+        [ui drawText:"Spread"
+                font:doubleFont
+                   x:doubleStartX + 19.0f
+                   y:L->segModeDouble.y + (L->segModeDouble.height - textH13) * 0.5f
+               color:doubleCol];
+    }
+
+    // Page indicator pill (clickable to open Jump modal)
+    bool hasBook = (book != nil && book.pageCount > 0u);
+    bool hovInd = hasBook && canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnPageIndicator);
+    [ui drawRoundedRect:L->btnPageIndicator
+                 radius:6.0f
+                   fill:(hovInd ? kColHoverFill : kColTroughBg)
+                 border:(hovInd ? kColAccentBorder : kColBorder)
+            borderWidth:1.0f];
+    XSCString *indStr = _model.pageIndicatorText;
+    const char *indTxt = (hasBook && indStr && indStr.length > 0u) ? indStr.utf8 : "\xE2\x80\x94";
+    XSCFontSlot indFont = XSCFontMono13;
+    if ([ui measureTextWidth:indTxt font:XSCFontMono13] > L->btnPageIndicator.width - 10.0f) {
+        indFont = XSCFontSmall11;
+    }
+    [ui drawTextCentered:indTxt
+                    font:indFont
+                  inRect:L->btnPageIndicator
+                   color:(hasBook ? kColTextPrimary : kColTextMuted)];
+
+    // Zoom control cluster: [-] [Fit/100%] [+]
+    [ui drawRoundedRect:L->zoomGroup radius:7.0f fill:kColTroughBg border:kColBorder borderWidth:1.0f];
+    bool hovZOut = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnZoomOut);
+    bool hovZLbl = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnZoomLabel);
+    bool hovZIn  = canHover && xsc_pt_in_rect(_mouseX, _mouseY, L->btnZoomIn);
+
+    if (hovZOut) {
+        [ui drawRoundedRect:(XSCRectF){ L->btnZoomOut.x + 2.0f, L->btnZoomOut.y + 2.0f, L->btnZoomOut.width - 2.0f, L->btnZoomOut.height - 4.0f }
+                     radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    if (hovZLbl) {
+        [ui drawRoundedRect:(XSCRectF){ L->btnZoomLabel.x + 1.0f, L->btnZoomLabel.y + 2.0f, L->btnZoomLabel.width - 2.0f, L->btnZoomLabel.height - 4.0f }
+                     radius:4.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    if (hovZIn) {
+        [ui drawRoundedRect:(XSCRectF){ L->btnZoomIn.x, L->btnZoomIn.y + 2.0f, L->btnZoomIn.width - 2.0f, L->btnZoomIn.height - 4.0f }
+                     radius:5.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+    }
+    // Subtle inner dividers
+    [ui drawRect:(XSCRectF){ L->btnZoomLabel.x, L->zoomGroup.y + 6.0f, 1.0f, L->zoomGroup.height - 12.0f } fill:kColBorder];
+    [ui drawRect:(XSCRectF){ L->btnZoomIn.x, L->zoomGroup.y + 6.0f, 1.0f, L->zoomGroup.height - 12.0f } fill:kColBorder];
+
+    xsc_draw_minus_icon(ui, L->btnZoomOut, hovZOut ? kColTextPrimary : kColTextSecondary);
+    [ui drawTextCentered:_zoomLabel
+                    font:XSCFontMono13
+                  inRect:L->btnZoomLabel
+                   color:(_canvas.zoomMode == XSCZoomModeCustom ? kColAccent : kColTextPrimary)];
+    xsc_draw_plus_icon(ui, L->btnZoomIn, hovZIn ? kColTextPrimary : kColTextSecondary);
+
+    // [Prefs] settings toggle button
+    bool hovPrefs = !_showJumpModal && xsc_pt_in_rect(_mouseX, _mouseY, L->btnPrefs);
+    XSCColor prFill   = _showSettings ? kColAccentTint : (hovPrefs ? kColHoverFill : kColClear);
+    XSCColor prBorder = _showSettings ? kColAccentBorder : (hovPrefs ? kColBorderStrong : kColClear);
+    XSCColor prIcon   = _showSettings ? kColAccent : (hovPrefs ? kColTextPrimary : kColTextSecondary);
+    [ui drawRoundedRect:L->btnPrefs radius:6.0f fill:prFill border:prBorder borderWidth:1.0f];
+    xsc_draw_prefs_icon(ui, L->btnPrefs, prIcon);
+}
+
+- (void)drawSidebar {
+    if (!_showsSidebar) return;
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    size_t pageCount = book ? book.pageCount : 0u;
+
+    // Sidebar background & right divider
+    [ui drawRect:L->sidebar fill:kColChromeBg];
+    [ui drawRect:(XSCRectF){ L->sidebar.width, L->sidebar.y, 1.0f, L->sidebar.height } fill:kColBorder];
+
+    // Sidebar header strip
+    float hdrH = kXSCSidebarHeaderH;
+    float smallH = [ui fontHeight:XSCFontSmall11];
+    [ui drawText:"PAGES"
+            font:XSCFontSmall11
+               x:12.0f
+               y:L->sidebar.y + (hdrH - smallH) * 0.5f
+           color:kColTextMuted];
+    if (pageCount > 0u) {
+        char countBuf[24];
+        snprintf(countBuf, sizeof(countBuf), "%zu", pageCount);
+        float cw = [ui measureTextWidth:countBuf font:XSCFontSmall11];
+        [ui drawText:countBuf
+                font:XSCFontSmall11
+                   x:L->sidebar.width - 12.0f - cw
+                   y:L->sidebar.y + (hdrH - smallH) * 0.5f
+               color:kColTextMuted];
+    }
+    [ui drawRect:(XSCRectF){ 0.0f, L->sidebar.y + hdrH - 1.0f, L->sidebar.width, 1.0f } fill:kColBorder];
+
+    // Scissored page list
+    [ui pushScissorRect:L->sidebarList];
+    defer { [ui popScissor]; }
+
+    if (pageCount == 0u) {
+        [ui drawText:"No pages loaded"
+                font:XSCFontSmall11
+                   x:14.0f
+                   y:L->sidebarList.y + 16.0f
+               color:kColTextMuted];
+        return;
+    }
+
+    XSCIndexList *visible = _model.visualPageIndices;
+    size_t firstRow = (size_t)fmaxf(0.0f, floorf((_sidebarScrollY - 6.0f) / kXSCSidebarRowH));
+    size_t maxVisRows = (size_t)ceilf(L->sidebarList.height / kXSCSidebarRowH) + 2u;
+    size_t lastRow = firstRow + maxVisRows;
+    if (lastRow > pageCount) lastRow = pageCount;
+
+    for (size_t i = firstRow; i < lastRow; i++) {
+        float ry = L->sidebarList.y + 6.0f + (float)i * kXSCSidebarRowH - _sidebarScrollY;
+        XSCRectF pill = { 8.0f, ry + 2.0f, L->sidebar.width - 18.0f, kXSCSidebarRowH - 4.0f };
+        bool active = visible ? [visible containsValue:i] : (i == _model.currentIndex);
+        bool hovered = !_showJumpModal && !_showSettings && xsc_pt_in_rect(_mouseX, _mouseY, pill);
+
+        if (active) {
+            [ui drawRoundedRect:pill radius:6.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+        } else if (hovered) {
+            [ui drawRoundedRect:pill radius:6.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+        }
+
+        char pageLbl[32];
+        snprintf(pageLbl, sizeof(pageLbl), "Page %zu", i + 1u);
+        [ui drawText:pageLbl
+                font:(active ? XSCFontBold13 : XSCFontRegular13)
+                   x:pill.x + 10.0f
+                   y:pill.y + 4.5f
+               color:(active ? kColTextWhite : kColTextPrimary)];
+
+        XSCString *name = [book pageNameAtIndex:i];
+        if (name && name.length > 0u) {
+            XSCString *base = [name lastPathComponent];
+            [ui drawTextEllipsized:base.utf8
+                              font:XSCFontSmall11
+                                 x:pill.x + 10.0f
+                                 y:pill.y + 21.5f
+                          maxWidth:pill.width - 18.0f
+                             color:(active ? xsc_rgba(255, 255, 255, 0.80f) : kColTextMuted)];
+        }
+    }
+
+    // Minimalist scrollbar thumb when scrollable
+    float contentH = (float)pageCount * kXSCSidebarRowH + 12.0f;
+    if (contentH > L->sidebarList.height && L->sidebarList.height > 20.0f) {
+        float ratio = L->sidebarList.height / contentH;
+        float thumbH = fmaxf(26.0f, L->sidebarList.height * ratio);
+        float maxScroll = contentH - L->sidebarList.height;
+        float scrollFrac = (maxScroll > 0.0f) ? (_sidebarScrollY / maxScroll) : 0.0f;
+        float thumbY = L->sidebarList.y + 4.0f + scrollFrac * (L->sidebarList.height - thumbH - 8.0f);
+        [ui drawRoundedRect:(XSCRectF){ L->sidebar.width - 6.0f, thumbY, 4.0f, thumbH }
+                     radius:2.0f
+                       fill:xsc_rgba(154, 160, 173, 0.32f)
+                     border:kColClear
+                borderWidth:0.0f];
+    }
+}
+
+- (void)drawEmptyStateCTA {
+    if (!_canvas.showEmptyCTA || _canvas.isLoading) return;
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+    XSCRectF card = L->emptyCard;
+
+    [ui drawShadowForRect:card radius:16.0f spread:22.0f offsetY:8.0f];
+    [ui drawRoundedRect:card radius:16.0f fill:kColCardBg border:kColBorder borderWidth:1.0f];
+
+    xsc_draw_empty_emblem(ui, card.x + card.width * 0.5f, card.y + 26.0f);
+
+    [ui drawTextCentered:"xsComic"
+                    font:XSCFontHero28
+                  inRect:(XSCRectF){ card.x, card.y + 82.0f, card.width, 36.0f }
+                   color:kColTextPrimary];
+
+    [ui drawTextCentered:"CBZ \xC2\xB7 CBR \xC2\xB7 CB7 \xC2\xB7 CBT \xC2\xB7 Image Folders"
+                    font:XSCFontRegular13
+                  inRect:(XSCRectF){ card.x, card.y + 124.0f, card.width, 22.0f }
+                   color:kColTextSecondary];
+
+    bool hovBtn = !_showJumpModal && !_showSettings && xsc_pt_in_rect(_mouseX, _mouseY, L->emptyOpenBtn);
+    [ui drawRoundedRect:L->emptyOpenBtn
+                 radius:8.0f
+                   fill:(hovBtn ? kColAccentHover : kColAccent)
+                 border:kColClear
+            borderWidth:0.0f];
+    [ui drawTextCentered:"Open Comic\xE2\x80\xA6"
+                    font:XSCFontBold13
+                  inRect:L->emptyOpenBtn
+                   color:kColTextWhite];
+
+    const char *hint = "Drop a comic archive or folder here \xC2\xB7 Press Ctrl+O to open";
+    float hintMaxW = card.width - 24.0f;
+    if ([ui measureTextWidth:hint font:XSCFontSmall11] <= hintMaxW) {
+        [ui drawTextCentered:hint
+                        font:XSCFontSmall11
+                      inRect:(XSCRectF){ card.x + 12.0f, card.y + 220.0f, hintMaxW, 20.0f }
+                       color:kColTextMuted];
+    } else {
+        float hh = [ui fontHeight:XSCFontSmall11];
+        [ui drawTextEllipsized:hint
+                          font:XSCFontSmall11
+                             x:card.x + 12.0f
+                             y:card.y + 220.0f + (20.0f - hh) * 0.5f
+                      maxWidth:hintMaxW
+                         color:kColTextMuted];
+    }
+}
+
+- (void)drawStatusAndErrorOverlays {
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+
+    // Loading / status pill
+    XSCString *status = xsc_unwrap_opt_string(_canvas.statusText);
+    const char *label = NULL;
+    if (status && status.length > 0u) {
+        label = status.utf8;
+    } else if (_canvas.isLoading) {
+        label = "Loading\xE2\x80\xA6";
+    }
+    if (label) {
+        float tw = [ui measureTextWidth:label font:XSCFontRegular13];
+        float dotPad = _canvas.isLoading ? 18.0f : 0.0f;
+        float pw = fmaxf(120.0f, tw + 36.0f + dotPad);
+        float ph = 38.0f;
+        XSCRectF pill = {
+            floorf(L->canvas.x + (L->canvas.width - pw) * 0.5f),
+            floorf(L->canvas.y + (L->canvas.height - ph) * 0.5f),
+            pw, ph
+        };
+        [ui drawShadowForRect:pill radius:10.0f spread:14.0f offsetY:5.0f];
+        [ui drawRoundedRect:pill radius:10.0f fill:xsc_rgba(24, 26, 32, 0.94f) border:kColBorderStrong borderWidth:1.0f];
+        if (_canvas.isLoading) {
+            [ui drawRoundedRect:(XSCRectF){ pill.x + 16.0f, pill.y + (ph - 8.0f) * 0.5f, 8.0f, 8.0f }
+                         radius:4.0f fill:kColAccent border:kColClear borderWidth:0.0f];
+            float th = [ui fontHeight:XSCFontRegular13];
+            [ui drawText:label font:XSCFontRegular13 x:pill.x + 32.0f y:pill.y + (ph - th) * 0.5f color:kColTextPrimary];
+        } else {
+            [ui drawTextCentered:label font:XSCFontRegular13 inRect:pill color:kColTextPrimary];
+        }
+    }
+
+    // Dismissible error banner
+    if (_errorBanner && _errorBanner.length > 0u) {
+        XSCRectF b = L->errorBanner;
+        [ui drawShadowForRect:b radius:8.0f spread:12.0f offsetY:4.0f];
+        [ui drawRoundedRect:b radius:8.0f fill:kColErrorBg border:kColErrorBorder borderWidth:1.0f];
+        float th = [ui fontHeight:XSCFontRegular13];
+        [ui drawTextEllipsized:_errorBanner.utf8
+                          font:XSCFontRegular13
+                             x:b.x + 14.0f
+                             y:b.y + (b.height - th) * 0.5f
+                      maxWidth:b.width - 52.0f
+                         color:kColErrorText];
+        bool hovClose = xsc_pt_in_rect(_mouseX, _mouseY, L->errorDismissBtn);
+        if (hovClose) {
+            [ui drawRoundedRect:L->errorDismissBtn radius:4.0f fill:xsc_rgba(255, 255, 255, 0.10f) border:kColClear borderWidth:0.0f];
+        }
+        [ui drawTextCentered:"\xC3\x97" font:XSCFontBold13 inRect:L->errorDismissBtn color:kColErrorText];
+    }
+}
+
+- (void)drawSettingsPopover {
+    if (!_showSettings) return;
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+    XSCRectF card = L->settingsCard;
+
+    [ui drawShadowForRect:card radius:10.0f spread:18.0f offsetY:6.0f];
+    [ui drawRoundedRect:card radius:10.0f fill:kColChromeBg border:kColBorderStrong borderWidth:1.0f];
+
+    [ui drawText:"Settings" font:XSCFontModal16 x:card.x + 16.0f y:card.y + 12.0f color:kColTextPrimary];
+    [ui drawRect:(XSCRectF){ card.x + 1.0f, card.y + 40.0f, card.width - 2.0f, 1.0f } fill:kColBorder];
+
+    struct {
+        XSCRectF rect;
+        bool checked;
+        const char *label;
+    } rows[2] = {
+        { L->settingsRowSwapRTL,  _prefs.swapRTLPageTurnKeys,   "Swap left/right page-turn keys in RTL" },
+        { L->settingsRowContinue, _prefs.continueAcrossVolumes, "Continue into adjacent volumes" },
+    };
+
+    float textH = [ui fontHeight:XSCFontRegular13];
+    for (int i = 0; i < 2; i++) {
+        bool hov = xsc_pt_in_rect(_mouseX, _mouseY, rows[i].rect);
+        if (hov) {
+            [ui drawRoundedRect:rows[i].rect radius:6.0f fill:kColHoverFill border:kColClear borderWidth:0.0f];
+        }
+        XSCRectF box = { rows[i].rect.x + 10.0f, rows[i].rect.y + (rows[i].rect.height - 16.0f) * 0.5f, 16.0f, 16.0f };
+        [ui drawRoundedRect:box
+                     radius:4.0f
+                       fill:(rows[i].checked ? kColAccent : kColTroughBg)
+                     border:(rows[i].checked ? kColAccent : kColBorderStrong)
+                borderWidth:1.2f];
+        if (rows[i].checked) {
+            [ui drawTextCentered:"\xE2\x9C\x93" font:XSCFontBold13 inRect:box color:kColTextWhite];
+        }
+        [ui drawText:rows[i].label
+                font:XSCFontRegular13
+                   x:box.x + 26.0f
+                   y:rows[i].rect.y + (rows[i].rect.height - textH) * 0.5f
+               color:kColTextPrimary];
+    }
+}
+
+- (void)drawJumpModal {
+    if (!_showJumpModal) return;
+    XSCUIRenderer *ui = _ui;
+    const XSCLayout *L = &_layout;
+    XSCBook *book = xsc_unwrap_book(_model.book);
+    size_t pageCount = book ? book.pageCount : 0u;
+
+    // Dim scrim
+    [ui drawRect:(XSCRectF){ 0.0f, 0.0f, L->winW, L->winH } fill:kColScrim];
+
+    // Modal card
+    XSCRectF card = L->jumpCard;
+    [ui drawShadowForRect:card radius:12.0f spread:24.0f offsetY:10.0f];
+    [ui drawRoundedRect:card radius:12.0f fill:kColChromeBg border:kColBorderStrong borderWidth:1.0f];
+
+    // Header
+    [ui drawText:"Jump to Page" font:XSCFontModal16 x:card.x + 22.0f y:card.y + 18.0f color:kColTextPrimary];
+    if (pageCount > 0u) {
+        char rangeBuf[40];
+        snprintf(rangeBuf, sizeof(rangeBuf), "1 \xE2\x80\x93 %zu", pageCount);
+        float rw = [ui measureTextWidth:rangeBuf font:XSCFontSmall11];
+        [ui drawText:rangeBuf
+                font:XSCFontSmall11
+                   x:card.x + card.width - 22.0f - rw
+                   y:card.y + 22.0f
+               color:kColTextSecondary];
+    }
+
+    // Input field
+    XSCColor inputBorder = _jumpInvalid ? kColErrorBorder : kColAccent;
+    [ui drawRoundedRect:L->jumpInput radius:7.0f fill:kColTroughBg border:inputBorder borderWidth:1.5f];
+
+    float monoH = [ui fontHeight:XSCFontMono13];
+    float textX = L->jumpInput.x + 12.0f;
+    float textY = L->jumpInput.y + (L->jumpInput.height - monoH) * 0.5f;
+    float textW = 0.0f;
+    if (_jumpLen > 0u) {
+        textW = [ui measureTextWidth:_jumpBuf font:XSCFontMono13];
+        if (_jumpSelectAll) {
+            [ui drawRoundedRect:(XSCRectF){ textX - 3.0f, L->jumpInput.y + 6.0f, textW + 6.0f, L->jumpInput.height - 12.0f }
+                         radius:3.0f
+                           fill:kColAccentTint
+                         border:kColClear
+                    borderWidth:0.0f];
+        }
+        [ui drawText:_jumpBuf font:XSCFontMono13 x:textX y:textY color:kColTextPrimary];
+    } else {
+        [ui drawText:"Enter page number\xE2\x80\xA6" font:XSCFontRegular13 x:textX y:textY color:kColTextMuted];
+    }
+
+    // Caret (blinks interactively, always crisp & visible on screenshot capture)
+    bool caretVisible = (_opts.screenshotPath != NULL) || _jumpCaretVisible;
+    if (caretVisible) {
+        [ui drawRect:(XSCRectF){ textX + textW + 1.5f, L->jumpInput.y + 8.0f, 1.8f, L->jumpInput.height - 16.0f }
+                fill:kColAccent];
+    }
+
+    if (_jumpInvalid) {
+        if (pageCount > 0u) {
+            char hintBuf[64];
+            snprintf(hintBuf, sizeof(hintBuf), "Enter a number from 1 to %zu", pageCount);
+            [ui drawText:hintBuf font:XSCFontSmall11 x:card.x + 22.0f y:L->jumpInput.y + 42.0f color:kColErrorText];
+        } else {
+            [ui drawText:"No comic open" font:XSCFontSmall11 x:card.x + 22.0f y:L->jumpInput.y + 42.0f color:kColErrorText];
+        }
+    }
+
+    // Action buttons
+    bool hovCancel = xsc_pt_in_rect(_mouseX, _mouseY, L->jumpCancelBtn);
+    bool hovGo     = xsc_pt_in_rect(_mouseX, _mouseY, L->jumpGoBtn);
+    [ui drawRoundedRect:L->jumpCancelBtn
+                 radius:6.0f
+                   fill:(hovCancel ? kColHoverFill : kColBtnFill)
+                 border:kColBorder
+            borderWidth:1.0f];
+    [ui drawTextCentered:"Cancel" font:XSCFontRegular13 inRect:L->jumpCancelBtn color:kColTextPrimary];
+
+    [ui drawRoundedRect:L->jumpGoBtn
+                 radius:6.0f
+                   fill:(hovGo ? kColAccentHover : kColAccent)
+                 border:kColClear
+            borderWidth:0.0f];
+    [ui drawTextCentered:"Jump" font:XSCFontBold13 inRect:L->jumpGoBtn color:kColTextWhite];
+}
+
+- (void)renderSceneToBackbuffer {
+    // 1. Clear entire window with canvas base color.
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, _drawableW, _drawableH);
+    glClearColor(kColCanvasBg.r, kColCanvasBg.g, kColCanvasBg.b, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    // 2. Render comic page(s) inside the canvas viewport.
+    [_canvas render];
+
+    // 3. Render crisp 2D OpenGL chrome & overlays.
+    [_ui beginFrameWithDrawableWidth:_drawableW
+                      drawableHeight:_drawableH
+                        backingScale:_backingScale];
+    [self drawSidebar];
+    [self drawToolbarFull];
+    [self drawEmptyStateCTA];
+    [self drawStatusAndErrorOverlays];
+    [self drawSettingsPopover];
+    [self drawJumpModal];
+    [_ui endFrame];
+}
+
+- (void)renderFrame {
+    [self renderSceneToBackbuffer];
+    SDL_GL_SwapWindow(_window);
+    _needsRedraw = false;
+}
+
+#pragma mark - Deterministic Screenshot Capture
+
+- (XSCScreenshotState)screenshotState {
+    if (!_opts.bookPath) return XSCScreenshotReady;
+    if (_model.isLoading) return XSCScreenshotWaiting;
+    if ([self screenshotError]) return XSCScreenshotFailed;
+    if (!_cliPostOpenApplied || _waitingPostJump) return XSCScreenshotWaiting;
+    return _hasDisplayedPage ? XSCScreenshotReady : XSCScreenshotWaiting;
+}
+
+- (XSCString *)screenshotError {
+    if (_errorBanner) return _errorBanner;
+    return _hasDisplayedStatus ? [XSCString stringWithUTF8:"The requested page could not be decoded."] : nil;
+}
+
+- (bool)captureScreenshotToPath:(const char *)path {
+    [self syncWindowMetrics];
+    [self renderSceneToBackbuffer];
+
+    size_t pixelBytes = (size_t)_drawableW * (size_t)_drawableH * 4u;
+    uint8_t *pixels = (uint8_t *)malloc(pixelBytes);
+    if (!pixels) return false;
+    defer { free(pixels); }
+
+    glReadBuffer(GL_BACK);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, _drawableW, _drawableH, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+    return xsc_write_rgba_png(path, _drawableW, _drawableH, pixels);
+}
+
+@end
+
+#pragma mark - CLI Parsing & Entrypoint
+
+static void xsc_print_usage(void) {
+    printf("Usage: xscomic [options] [book_path]\n"
+           "  --single            Start in single-page mode\n"
+           "  --double            Start in two-page spread mode\n"
+           "  --ltr               Start in left-to-right reading direction\n"
+           "  --rtl               Start in right-to-left reading direction\n"
+           "  --sidebar           Start with the page sidebar open\n"
+           "  --page N            Jump to 1-based page N after opening\n"
+           "  --zoom SCALE        Set custom zoom scale (e.g. 1.5)\n"
+           "  --size WxH          Set initial window size (min %dx%d)\n"
+           "  --jump-modal        Open the Jump-to-Page modal\n"
+           "  --settings          Open the Settings popover\n"
+           "  --screenshot PATH   Render frame, save PNG to PATH, and exit\n"
+           "  -h, --help          Show this help message\n",
+           kXSCMinWindowW, kXSCMinWindowH);
+}
+
+static bool xsc_cli_match_val(const char *arg,
+                              const char *flag,
+                              int *idx,
+                              int argc,
+                              char *argv[],
+                              const char **outVal) {
+    size_t flen = strlen(flag);
+    if (strcmp(arg, flag) == 0) {
+        *outVal = (*idx + 1 < argc && argv[*idx + 1][0] != '-') ? argv[++(*idx)] : "";
+        return true;
+    }
+    if (strncmp(arg, flag, flen) == 0 && arg[flen] == '=') {
+        *outVal = arg + flen + 1;
+        return true;
+    }
+    return false;
+}
+
+static bool xsc_parse_size_arg(const char *val, int *outW, int *outH) {
+    if (!val || val[0] == '\0') return false;
+    errno = 0;
+    char *sep = NULL;
+    long w = strtol(val, &sep, 10);
+    if (errno != 0 || !sep || sep == val || (*sep != 'x' && *sep != 'X')) {
+        return false;
+    }
+    char *end = NULL;
+    long h = strtol(sep + 1, &end, 10);
+    if (errno != 0 || !end || end == sep + 1 || *end != '\0') {
+        return false;
+    }
+    if (w <= 0 || h <= 0) return false;
+    if (w < kXSCMinWindowW) w = kXSCMinWindowW;
+    if (h < kXSCMinWindowH) h = kXSCMinWindowH;
+    if (w > 8192) w = 8192;
+    if (h > 8192) h = 8192;
+    *outW = (int)w;
+    *outH = (int)h;
+    return true;
+}
+
+typedef enum {
+    XSCCLIInvalid,
+    XSCCLIHelp,
+    XSCCLIRun,
+} XSCCLIResult;
+
+static XSCCLIResult xsc_parse_cli(int argc, char *argv[], XSCCLIOptions *opts) {
+    memset(opts, 0, sizeof(*opts));
+    opts->startMode = -1;
+    opts->startDir = -1;
+    bool positionalOnly = false;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!positionalOnly && strcmp(arg, "--") == 0) {
+            positionalOnly = true;
+            continue;
+        }
+        if (positionalOnly) {
+            if (!opts->bookPath && arg[0] != '\0') {
+                opts->bookPath = arg;
+                continue;
+            }
+            fprintf(stderr, "xscomic: expected a single nonempty book path\n");
+            return XSCCLIInvalid;
+        }
+
+        const char *val = NULL;
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            xsc_print_usage();
+            return XSCCLIHelp;
+        } else if (strcmp(arg, "--single") == 0) {
+            opts->startMode = 0;
+        } else if (strcmp(arg, "--double") == 0) {
+            opts->startMode = 1;
+        } else if (strcmp(arg, "--ltr") == 0) {
+            opts->startDir = 0;
+        } else if (strcmp(arg, "--rtl") == 0) {
+            opts->startDir = 1;
+        } else if (strcmp(arg, "--sidebar") == 0) {
+            opts->startSidebar = true;
+        } else if (strcmp(arg, "--jump-modal") == 0) {
+            opts->startJumpModal = true;
+        } else if (strcmp(arg, "--settings") == 0) {
+            opts->startSettings = true;
+        } else if (xsc_cli_match_val(arg, "--page", &i, argc, argv, &val)) {
+            errno = 0;
+            char *end = NULL;
+            long long p = strtoll(val, &end, 10);
+            if (errno != 0 || end == val || *end != '\0' || p < 1) {
+                fprintf(stderr, "xscomic: --page expects a positive integer\n");
+                return XSCCLIInvalid;
+            }
+            opts->startPage = (int64_t)p;
+        } else if (xsc_cli_match_val(arg, "--zoom", &i, argc, argv, &val)) {
+            errno = 0;
+            char *end = NULL;
+            float z = strtof(val, &end);
+            if (errno != 0 || end == val || *end != '\0' || !isfinite(z) || z <= 0.0f) {
+                fprintf(stderr, "xscomic: --zoom expects a finite positive number\n");
+                return XSCCLIInvalid;
+            }
+            opts->startZoom = z;
+        } else if (xsc_cli_match_val(arg, "--size", &i, argc, argv, &val)
+                   || xsc_cli_match_val(arg, "--window-size", &i, argc, argv, &val)) {
+            if (!xsc_parse_size_arg(val, &opts->startWidth, &opts->startHeight)) {
+                fprintf(stderr, "xscomic: --size expects a positive width and height (WxH)\n");
+                return XSCCLIInvalid;
+            }
+        } else if (xsc_cli_match_val(arg, "--screenshot", &i, argc, argv, &val)) {
+            if (val[0] == '\0' || opts->screenshotPath) {
+                fprintf(stderr, "xscomic: specify --screenshot once with an output path\n");
+                return XSCCLIInvalid;
+            }
+            opts->screenshotPath = val;
+        } else if (arg[0] != '-' && arg[0] != '\0' && !opts->bookPath) {
+            opts->bookPath = arg;
+        } else {
+            fprintf(stderr, "xscomic: unexpected argument '%s' (see --help)\n", arg);
+            return XSCCLIInvalid;
+        }
+    }
+    if (opts->startPage > 0 && !opts->bookPath) {
+        fprintf(stderr, "xscomic: --page requires a book path\n");
+        return XSCCLIInvalid;
+    }
+    return XSCCLIRun;
+}
+
+int main(int argc, char *argv[]) {
+    XSCCLIOptions opts;
+    XSCCLIResult parsed = xsc_parse_cli(argc, argv, &opts);
+    if (parsed != XSCCLIRun) return parsed == XSCCLIHelp ? 0 : 2;
+
+    // Enable UTF-8 LC_CTYPE (without touching LC_NUMERIC) so X11's
+    // Xutf8TextListToTextProperty updates _NET_WM_NAME for non-ASCII titles.
+    const char *ctype = setlocale(LC_CTYPE, "");
+    if (!ctype || strcmp(ctype, "C") == 0 || strcmp(ctype, "POSIX") == 0) {
+        if (!setlocale(LC_CTYPE, "C.UTF-8")) {
+            (void)setlocale(LC_CTYPE, "C.utf8");
+        }
+    }
+
+    xsc_mark_main_thread();
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "xscomic: SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    defer { SDL_Quit(); }
+
+    if (TTF_Init() != 0) {
+        fprintf(stderr, "xscomic: TTF_Init failed: %s\n", TTF_GetError());
+        return 1;
+    }
+    defer { TTF_Quit(); }
+
+    gWakeupEventType = SDL_RegisterEvents(1);
+    xsc_set_main_wakeup(xsc_sdl_wakeup);
+    defer { xsc_set_main_wakeup(NULL); }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+
+    int initW = (opts.startWidth >= kXSCMinWindowW) ? opts.startWidth : kXSCDefaultWindowW;
+    int initH = (opts.startHeight >= kXSCMinWindowH) ? opts.startHeight : kXSCDefaultWindowH;
+    Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    SDL_Window *window = SDL_CreateWindow("xsComic",
+                                          SDL_WINDOWPOS_CENTERED,
+                                          SDL_WINDOWPOS_CENTERED,
+                                          initW,
+                                          initH,
+                                          winFlags);
+    if (!window) {
+        fprintf(stderr, "xscomic: SDL_CreateWindow failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    defer { SDL_DestroyWindow(window); }
+
+    SDL_SetWindowMinimumSize(window, kXSCMinWindowW, kXSCMinWindowH);
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+    SDL_StopTextInput();
+
+    SDL_GLContext glCtx = SDL_GL_CreateContext(window);
+    if (!glCtx) {
+        fprintf(stderr, "xscomic: OpenGL 3.3 Core context creation failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    defer { SDL_GL_DeleteContext(glCtx); }
+
+    if (SDL_GL_SetSwapInterval(1) != 0) {
+        // Gracefully fall back if vsync is unavailable (e.g. Xvfb software rendering).
+        (void)SDL_GL_SetSwapInterval(0);
+    }
+
+    int exitCode = 0;
+    @autoreleasepool {
+        XSCGLCanvas *canvas = [[XSCGLCanvas alloc] init];
+        XSCUIRenderer *ui = [[XSCUIRenderer alloc] init];
+        XSCReaderModel *model = [[XSCReaderModel alloc] init];
+
+        bool glInitOK = true;
+        handle {
+            tryValue([canvas initializeGL]);
+            tryValue([ui initializeGL]);
+        } catch (XSCError *err) {
+            fprintf(stderr, "xscomic: GL init error (%d): %s\n", err.code, err.message.utf8);
+            glInitOK = false;
+        }
+        if (!glInitOK) {
+            xsc_set_main_wakeup(NULL);
+            [model.imageStore shutdown];
+            xsc_dispatch_bg_shutdown();
+            [canvas shutdownGL];
+            [ui shutdownGL];
+            return 1;
+        }
+
+        defer {
+            xsc_set_main_wakeup(NULL);
+            SDL_StopTextInput();
+            model.delegate = nil;
+            [model cancelBackgroundWork];
+            canvas.onZoomChanged = nil;
+            [model.imageStore shutdown];
+            xsc_dispatch_bg_shutdown();
+            (void)xsc_main_drain();
+            [canvas shutdownGL];
+            [ui shutdownGL];
+        }
+
+        XSCAppController *app = [[XSCAppController alloc] initWithWindow:window
+                                                                   model:model
+                                                                  canvas:canvas
+                                                                      ui:ui
+                                                                 options:&opts];
+        defer { [app closeFilePicker]; }
+        if (opts.screenshotPath) exitCode = 1;
+        static const uint64_t kXSCScreenshotTimeoutMs = 30000ULL;
+        uint64_t screenshotDeadlineMs = opts.screenshotPath
+            ? ((uint64_t)xsc_now_ms() + kXSCScreenshotTimeoutMs)
+            : UINT64_MAX;
+
+        while (!app.shouldQuit) {
+            uint64_t nowMs = (uint64_t)xsc_now_ms();
+            [app tickAtMs:nowMs];
+
+            if (opts.screenshotPath) {
+                XSCScreenshotState state = [app screenshotState];
+                if (state == XSCScreenshotFailed) {
+                    fprintf(stderr, "xscomic: %s\n", [app screenshotError].utf8);
+                    break;
+                }
+                if (state == XSCScreenshotReady) {
+                    if ([app captureScreenshotToPath:opts.screenshotPath]) {
+                        exitCode = 0;
+                    } else {
+                        fprintf(stderr, "xscomic: failed to write screenshot to %s\n", opts.screenshotPath);
+                    }
+                    break;
+                }
+                if (nowMs >= screenshotDeadlineMs) {
+                    fprintf(stderr, "xscomic: timed out waiting for screenshot to render\n");
+                    break;
+                }
+            }
+
+            if (app.needsRedraw) {
+                [app renderFrame];
+            }
+
+            uint64_t waitNowMs = (uint64_t)xsc_now_ms();
+            int waitMs = [app eventWaitAtMs:waitNowMs];
+            if (opts.screenshotPath && screenshotDeadlineMs < UINT64_MAX) {
+                uint64_t remaining = (screenshotDeadlineMs > waitNowMs) ? (screenshotDeadlineMs - waitNowMs) : 0ULL;
+                if (remaining < (uint64_t)waitMs) {
+                    waitMs = (int)remaining;
+                }
+            }
+            SDL_Event ev;
+            if (SDL_WaitEventTimeout(&ev, waitMs)) {
+                [app handleSDLEvent:&ev];
+                while (!app.shouldQuit && SDL_PollEvent(&ev)) {
+                    [app handleSDLEvent:&ev];
+                }
+            }
+        }
+    }
+
+    return exitCode;
+}

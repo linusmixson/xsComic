@@ -1,0 +1,876 @@
+/*
+ XSCGLCanvas.objc3 — Direct OpenGL 3.3 Core comic page renderer for Linux.
+
+ Presentation & GPU Pipeline:
+   1. Direct L8 / RGBA8 texture uploads: monochrome/grayscale manga pages upload
+      as `GL_R8` (1 byte/pixel) and expand `.rrr1` in the fragment shader; color
+      pages upload as `GL_RGBA8` (4 bytes/pixel) with `GL_UNPACK_ROW_LENGTH`
+      honoring page-aligned row strides.
+   2. Hybrid decode-once, GPU-scale-always pipeline: 6x6 separable Lanczos-3
+      downscaling on the base level for normal reading reductions (1.05x-3x)
+      to preserve crisp manga screentones, lazy trilinear mipmaps above 3x to
+      prevent extreme-zoom aliasing, and linear filtering at native/upscale.
+      Color uploads premultiply alpha to keep hidden RGB out of filtered edges.
+   3. Full EXIF 1..8 orientation transform in-shader and a 1 backing-pixel
+      hairline page border without offscreen shadow surfaces.
+   4. In-place multi-frame animated GIF frame playback via `tickAnimationAtMs:`.
+ */
+
+#include "XSCGLCanvas.h"
+
+#include <SDL2/SDL.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+static const float kXSCCanvasInset = 12.0f;
+static const float kXSCPageSpacing = 8.0f;
+static const float kXSCMinZoomScale = 0.1f;
+static const float kXSCMaxZoomScale = 16.0f;
+
+bool xsc_gl_load_procs(XSCGLProcs *gl) {
+    memset(gl, 0, sizeof(*gl));
+    gl->genVertexArrays    = (PFNGLGENVERTEXARRAYSPROC)SDL_GL_GetProcAddress("glGenVertexArrays");
+    gl->deleteVertexArrays = (PFNGLDELETEVERTEXARRAYSPROC)SDL_GL_GetProcAddress("glDeleteVertexArrays");
+    gl->bindVertexArray    = (PFNGLBINDVERTEXARRAYPROC)SDL_GL_GetProcAddress("glBindVertexArray");
+    gl->createShader       = (PFNGLCREATESHADERPROC)SDL_GL_GetProcAddress("glCreateShader");
+    gl->shaderSource       = (PFNGLSHADERSOURCEPROC)SDL_GL_GetProcAddress("glShaderSource");
+    gl->compileShader      = (PFNGLCOMPILESHADERPROC)SDL_GL_GetProcAddress("glCompileShader");
+    gl->getShaderiv        = (PFNGLGETSHADERIVPROC)SDL_GL_GetProcAddress("glGetShaderiv");
+    gl->getShaderInfoLog   = (PFNGLGETSHADERINFOLOGPROC)SDL_GL_GetProcAddress("glGetShaderInfoLog");
+    gl->deleteShader       = (PFNGLDELETESHADERPROC)SDL_GL_GetProcAddress("glDeleteShader");
+    gl->createProgram      = (PFNGLCREATEPROGRAMPROC)SDL_GL_GetProcAddress("glCreateProgram");
+    gl->attachShader       = (PFNGLATTACHSHADERPROC)SDL_GL_GetProcAddress("glAttachShader");
+    gl->linkProgram        = (PFNGLLINKPROGRAMPROC)SDL_GL_GetProcAddress("glLinkProgram");
+    gl->getProgramiv       = (PFNGLGETPROGRAMIVPROC)SDL_GL_GetProcAddress("glGetProgramiv");
+    gl->getProgramInfoLog  = (PFNGLGETPROGRAMINFOLOGPROC)SDL_GL_GetProcAddress("glGetProgramInfoLog");
+    gl->deleteProgram      = (PFNGLDELETEPROGRAMPROC)SDL_GL_GetProcAddress("glDeleteProgram");
+    gl->useProgram         = (PFNGLUSEPROGRAMPROC)SDL_GL_GetProcAddress("glUseProgram");
+    gl->getUniformLocation = (PFNGLGETUNIFORMLOCATIONPROC)SDL_GL_GetProcAddress("glGetUniformLocation");
+    gl->uniform1i          = (PFNGLUNIFORM1IPROC)SDL_GL_GetProcAddress("glUniform1i");
+    gl->uniform1f          = (PFNGLUNIFORM1FPROC)SDL_GL_GetProcAddress("glUniform1f");
+    gl->uniform2f          = (PFNGLUNIFORM2FPROC)SDL_GL_GetProcAddress("glUniform2f");
+    gl->uniform4f          = (PFNGLUNIFORM4FPROC)SDL_GL_GetProcAddress("glUniform4f");
+    gl->activeTexture      = (PFNGLACTIVETEXTUREPROC)SDL_GL_GetProcAddress("glActiveTexture");
+    gl->generateMipmap     = (PFNGLGENERATEMIPMAPPROC)SDL_GL_GetProcAddress("glGenerateMipmap");
+    gl->blendFuncSeparate  = (PFNGLBLENDFUNCSEPARATEPROC)SDL_GL_GetProcAddress("glBlendFuncSeparate");
+
+    return gl->genVertexArrays && gl->deleteVertexArrays && gl->bindVertexArray
+        && gl->createShader && gl->shaderSource && gl->compileShader
+        && gl->getShaderiv && gl->getShaderInfoLog && gl->deleteShader
+        && gl->createProgram && gl->attachShader && gl->linkProgram
+        && gl->getProgramiv && gl->getProgramInfoLog && gl->deleteProgram
+        && gl->useProgram && gl->getUniformLocation
+        && gl->uniform1i && gl->uniform1f && gl->uniform2f && gl->uniform4f
+        && gl->activeTexture && gl->generateMipmap;
+}
+
+static XSCDecodedPage *xsc_unwrap_page(XSCOptDecodedPage opt) {
+    match(opt) {
+        case .Some(let p): { return p; }
+        case .None: { return nil; }
+    }
+}
+
+static XSCString *xsc_unwrap_string(XSCOptString opt) {
+    match(opt) {
+        case .Some(let s): { return s; }
+        case .None: { return nil; }
+    }
+}
+
+/*
+ Inline OpenGL 3.3 Core page shaders:
+   - Vertex shader emits 6 vertices via gl_VertexID using an empty VAO.
+     uv=(0,0) maps to top-left (uRect.x, uRect.w) and uv=(1,1) to bottom-right
+     (uRect.z, uRect.y), matching row-0-top decoded pixel memory layout.
+   - Fragment shader applies EXIF orientation, hybrid Lanczos-3 (1.05x-3x)
+     and mipmapped (>3x) downscaling, .rrr1 expansion for GL_R8 manga pages,
+     and a one-pixel inner border.
+ */
+static const char * const kXSCPageVertexShader =
+    "#version 330 core\n"
+    "uniform vec4 uRect;\n"
+    "out vec2 vUV;\n"
+    "void main() {\n"
+    "    const vec2 k[6] = vec2[6](\n"
+    "        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),\n"
+    "        vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)\n"
+    "    );\n"
+    "    vec2 c = k[gl_VertexID];\n"
+    "    gl_Position = vec4(mix(uRect.x, uRect.z, c.x), mix(uRect.w, uRect.y, c.y), 0.0, 1.0);\n"
+    "    vUV = c;\n"
+    "}\n";
+
+static const char * const kXSCPageFragmentShader =
+    "#version 330 core\n"
+    "in vec2 vUV;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform vec2 uTexSize;\n"
+    "uniform vec2 uDstSize;\n"
+    "uniform int uOrientation;\n"
+    "uniform int uIsGrayscale;\n"
+    "\n"
+    "vec2 ex(vec2 u, int o) {\n"
+    "    if (o == 2) return vec2(1.0 - u.x, u.y);\n"
+    "    if (o == 3) return vec2(1.0 - u.x, 1.0 - u.y);\n"
+    "    if (o == 4) return vec2(u.x, 1.0 - u.y);\n"
+    "    if (o == 5) return vec2(u.y, u.x);\n"
+    "    if (o == 6) return vec2(u.y, 1.0 - u.x);\n"
+    "    if (o == 7) return vec2(1.0 - u.y, 1.0 - u.x);\n"
+    "    if (o == 8) return vec2(1.0 - u.y, u.x);\n"
+    "    return u;\n"
+    "}\n"
+    "\n"
+    "float l3(float x) {\n"
+    "    float a = abs(x);\n"
+    "    if (a < 1e-4) return 1.0;\n"
+    "    if (a >= 3.0) return 0.0;\n"
+    "    float p = 3.14159265 * a;\n"
+    "    float q = p / 3.0;\n"
+    "    return (sin(p) * sin(q)) / (p * q);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 ru = ex(vUV, uOrientation);\n"
+    "    vec2 ot = (uOrientation >= 5 && uOrientation <= 8) ? uTexSize.yx : uTexSize;\n"
+    "    vec2 rt = ot / max(uDstSize, vec2(1.0));\n"
+    "    float maxRatio = max(rt.x, rt.y);\n"
+    "    vec4 c;\n"
+    "    if (maxRatio > 1.05 && maxRatio <= 3.0) {\n"
+    "        vec2 tx = 1.0 / max(uTexSize, vec2(1.0));\n"
+    "        vec2 rr = (uOrientation >= 5 && uOrientation <= 8) ? rt.yx : rt;\n"
+    "        vec2 st = tx * clamp(rr * 0.5, vec2(1.0), vec2(1.5));\n"
+    "        vec2 co = ru * uTexSize - 0.5;\n"
+    "        vec2 f = fract(co);\n"
+    "        vec2 b = (floor(co) + 0.5) * tx;\n"
+    "        vec4 a = vec4(0.0);\n"
+    "        float ws = 0.0;\n"
+    "        for (int j = -2; j <= 3; ++j) {\n"
+    "            float wy = l3(float(j) - f.y);\n"
+    "            for (int i = -2; i <= 3; ++i) {\n"
+    "                float w = l3(float(i) - f.x) * wy;\n"
+    "                a += textureLod(uTex, b + vec2(float(i), float(j)) * st, 0.0) * w;\n"
+    "                ws += w;\n"
+    "            }\n"
+    "        }\n"
+    "        c = clamp(a / max(ws, 1e-5), 0.0, 1.0);\n"
+    "        c.rgb = min(c.rgb, vec3(c.a));\n"
+    "    } else {\n"
+    "        c = texture(uTex, ru);\n"
+    "    }\n"
+    "    if (uIsGrayscale != 0) {\n"
+    "        c = vec4(c.r, c.r, c.r, 1.0);\n"
+    "    }\n"
+    "    vec2 px = vUV * uDstSize;\n"
+    "    if (px.x < 1.0 || px.y < 1.0 || px.x > uDstSize.x - 1.0 || px.y > uDstSize.y - 1.0) {\n"
+    "        c.rgb = mix(c.rgb, vec3(0.0), 0.16);\n"
+    "    }\n"
+    "    fragColor = c;\n"
+    "}\n";
+
+typedef struct XSCPageSlot {
+    GLuint texID;
+    bool texDirty;
+    bool texIsGrayscale;
+    bool mipmapsDirty;
+    size_t gifFrame;
+    uint64_t gifStartMs;
+    uint64_t gifNextMs;
+} XSCPageSlot;
+
+static GLuint xsc_compile_shader(const XSCGLProcs *gl,
+                                 GLenum type,
+                                 const char *source,
+                                 const char *label,
+                                 int baseErrCode) throws(XSCError *) {
+    GLuint shader = gl->createShader(type);
+    if (shader == 0u) {
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI
+                                             code:baseErrCode + 1
+                                          message:"Failed to allocate OpenGL shader object."];
+        throwError(err);
+    }
+    gl->shaderSource(shader, 1, &source, NULL);
+    gl->compileShader(shader);
+    GLint ok = 0;
+    gl->getShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (ok == GL_FALSE) {
+        char logBuf[1024];
+        GLsizei logLen = 0;
+        gl->getShaderInfoLog(shader, (GLsizei)sizeof(logBuf) - 1, &logLen, logBuf);
+        logBuf[(logLen >= 0 && logLen < (GLsizei)sizeof(logBuf)) ? logLen : 0] = '\0';
+        gl->deleteShader(shader);
+        XSCString *msg = [XSCString stringWithFormat:"%s shader compile error: %s", label, logBuf];
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI code:baseErrCode + 2 string:msg];
+        throwError(err);
+    }
+    return shader;
+}
+
+GLuint xsc_gl_build_program(const XSCGLProcs *gl,
+                            const char *vsSrc,
+                            const char *fsSrc,
+                            const char *label,
+                            int baseErrCode) throws(XSCError *) {
+    GLuint vs = 0u;
+    GLuint fs = 0u;
+    defer {
+        if (vs != 0u) gl->deleteShader(vs);
+        if (fs != 0u) gl->deleteShader(fs);
+    }
+
+    vs = tryValue(xsc_compile_shader(gl, GL_VERTEX_SHADER, vsSrc, label, baseErrCode));
+    fs = tryValue(xsc_compile_shader(gl, GL_FRAGMENT_SHADER, fsSrc, label, baseErrCode));
+
+    GLuint prog = gl->createProgram();
+    if (prog == 0u) {
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI
+                                             code:baseErrCode + 3
+                                          message:"Failed to create OpenGL shader program."];
+        throwError(err);
+    }
+    gl->attachShader(prog, vs);
+    gl->attachShader(prog, fs);
+    gl->linkProgram(prog);
+
+    GLint linked = 0;
+    gl->getProgramiv(prog, GL_LINK_STATUS, &linked);
+    if (linked == GL_FALSE) {
+        char logBuf[1024];
+        GLsizei logLen = 0;
+        gl->getProgramInfoLog(prog, (GLsizei)sizeof(logBuf) - 1, &logLen, logBuf);
+        logBuf[(logLen >= 0 && logLen < (GLsizei)sizeof(logBuf)) ? logLen : 0] = '\0';
+        gl->deleteProgram(prog);
+        XSCString *msg = [XSCString stringWithFormat:"%s program link error: %s", label, logBuf];
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI code:baseErrCode + 4 string:msg];
+        throwError(err);
+    }
+    return prog;
+}
+
+@implementation XSCGLCanvas {
+    XSCGLProcs _gl;
+    bool _glReady;
+    GLuint _program;
+    GLuint _vao;
+
+    GLint _uRectLoc;
+    GLint _uTexLoc;
+    GLint _uTexSizeLoc;
+    GLint _uDstSizeLoc;
+    GLint _uOrientationLoc;
+    GLint _uIsGrayscaleLoc;
+
+    XSCRectF _viewport;
+    int _drawableW;
+    int _drawableH;
+    float _backingScale;
+
+    XSCDecodedPage *_leftPage;
+    XSCDecodedPage *_rightPage;
+    XSCPageSlot _leftSlot;
+    XSCPageSlot _rightSlot;
+
+    XSCZoomMode _zoomMode;
+    float _customScale;
+    float _panOffsetX;
+    float _panOffsetY;
+
+    bool _showEmptyCTA;
+    bool _isLoading;
+    XSCString *_statusText;
+    XSCZoomChangedBlock _onZoomChanged;
+}
+
+- (XSCZoomMode)zoomMode { return _zoomMode; }
+- (bool)showEmptyCTA { return _showEmptyCTA; }
+- (bool)isLoading { return _isLoading; }
+- (XSCOptString)statusText {
+    return _statusText ? Some(XSCString *, _statusText) : None(XSCString *);
+}
+- (XSCZoomChangedBlock)onZoomChanged { return _onZoomChanged; }
+- (void)setOnZoomChanged:(XSCZoomChangedBlock)block { _onZoomChanged = block; }
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _zoomMode = XSCZoomModeFit;
+        _customScale = 1.0f;
+        _backingScale = 1.0f;
+        _showEmptyCTA = true;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_glReady && SDL_GL_GetCurrentContext() != NULL) {
+        [self shutdownGL];
+    } else {
+        _glReady = false;
+        _program = 0u;
+        _vao = 0u;
+        _leftSlot.texID = 0u;
+        _rightSlot.texID = 0u;
+    }
+}
+
+#pragma mark - OpenGL Lifecycle
+
+- (void)initializeGL throws(XSCError *) {
+    if (_glReady) return;
+
+    if (!xsc_gl_load_procs(&_gl)) {
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI
+                                             code:100
+                                          message:"OpenGL 3.3 Core entry points are unavailable."];
+        throwError(err);
+    }
+
+    GLuint prog = tryValue(xsc_gl_build_program(&_gl,
+                                                kXSCPageVertexShader,
+                                                kXSCPageFragmentShader,
+                                                "Page",
+                                                100));
+
+    GLuint vao = 0u;
+    _gl.genVertexArrays(1, &vao);
+    if (vao == 0u) {
+        _gl.deleteProgram(prog);
+        XSCError *err = [XSCError errorWithDomain:XSCErrorDomainUI
+                                             code:105
+                                          message:"Failed to allocate OpenGL VAO."];
+        throwError(err);
+    }
+
+    _program = prog;
+    _vao = vao;
+    _uRectLoc        = _gl.getUniformLocation(_program, "uRect");
+    _uTexLoc         = _gl.getUniformLocation(_program, "uTex");
+    _uTexSizeLoc     = _gl.getUniformLocation(_program, "uTexSize");
+    _uDstSizeLoc     = _gl.getUniformLocation(_program, "uDstSize");
+    _uOrientationLoc = _gl.getUniformLocation(_program, "uOrientation");
+    _uIsGrayscaleLoc = _gl.getUniformLocation(_program, "uIsGrayscale");
+    _glReady = true;
+
+    // Upload any pages that were attached before initializeGL ran.
+    if (_leftPage && (_leftSlot.texDirty || _leftSlot.texID == 0u)) {
+        [self uploadSlot:&_leftSlot page:_leftPage];
+    }
+    if (_rightPage && (_rightSlot.texDirty || _rightSlot.texID == 0u)) {
+        [self uploadSlot:&_rightSlot page:_rightPage];
+    }
+}
+
+- (void)shutdownGL {
+    if (!_glReady) return;
+    [self releaseTextureForSlot:&_leftSlot];
+    [self releaseTextureForSlot:&_rightSlot];
+    _leftPage = nil;
+    _rightPage = nil;
+    _statusText = nil;
+    if (_vao != 0u && _gl.deleteVertexArrays) {
+        _gl.deleteVertexArrays(1, &_vao);
+        _vao = 0u;
+    }
+    if (_program != 0u && _gl.deleteProgram) {
+        _gl.deleteProgram(_program);
+        _program = 0u;
+    }
+    _glReady = false;
+}
+
+#pragma mark - Texture Management & Animated GIF Playback
+
+- (void)releaseTextureForSlot:(XSCPageSlot *)slot {
+    if (slot->texID != 0u && _glReady) {
+        glDeleteTextures(1, &slot->texID);
+    }
+    *slot = (XSCPageSlot){ .gifNextMs = UINT64_MAX };
+}
+
+// Decoded pages retain straight RGBA for CPU clients. GIF pixels already have
+// either full alpha or all-zero channels. Only translucent static pages need
+// a temporary, associated-alpha upload buffer.
+static bool xsc_prepare_rgba_upload(const uint8_t *pixels, size_t width, size_t height,
+                                    size_t stride, uint8_t **output) {
+    *output = NULL;
+    for (size_t y = 0u; y < height; y++) {
+        const uint8_t *row = pixels + y * stride;
+        uint8_t allOpaque = 255u;
+        for (size_t x = 0u; x < width; x++) allOpaque &= row[x * 4u + 3u];
+        if (allOpaque == 255u) continue;
+
+        uint8_t *associated = (uint8_t *)malloc(width * height * 4u);
+        if (!associated) return false;
+        // The preceding rows were fully opaque.
+        for (size_t previous = 0u; previous < y; previous++) {
+            memcpy(associated + previous * width * 4u, pixels + previous * stride, width * 4u);
+        }
+        for (; y < height; y++) {
+            const uint8_t *src = pixels + y * stride;
+            uint8_t *dst = associated + y * width * 4u;
+            for (size_t x = 0u; x < width; x++, src += 4u, dst += 4u) {
+                unsigned alpha = src[3];
+                dst[0] = (uint8_t)((src[0] * alpha + 127u) / 255u);
+                dst[1] = (uint8_t)((src[1] * alpha + 127u) / 255u);
+                dst[2] = (uint8_t)((src[2] * alpha + 127u) / 255u);
+                dst[3] = src[3];
+            }
+        }
+        *output = associated;
+        break;
+    }
+    return true;
+}
+
+- (void)uploadSlot:(XSCPageSlot *)slot page:(XSCDecodedPage *)page {
+    if (!_glReady) {
+        slot->texDirty = (page != nil);
+        return;
+    }
+    [self releaseTextureForSlot:slot];
+    if (!page || page.pixelWidth == 0u || page.pixelHeight == 0u || !page.pixels) return;
+
+    const uint8_t *pixels = page.pixels;
+    bool uploadGray = page.isGrayscale;
+    size_t rowBytes = page.bytesPerRow;
+    uint8_t *associated = NULL;
+    defer { free(associated); }
+    if (!uploadGray && !page.isAnimatedGIF &&
+        !xsc_prepare_rgba_upload(pixels, page.pixelWidth, page.pixelHeight, rowBytes, &associated)) {
+        return;
+    }
+    if (associated) {
+        pixels = associated;
+        rowBytes = page.pixelWidth * 4u;
+    }
+
+    GLuint tex = 0u;
+    glGenTextures(1, &tex);
+    if (tex == 0u) return;
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    size_t bpp = uploadGray ? 1u : 4u;
+    GLint rowLength = 0;
+    if (rowBytes > page.pixelWidth * bpp && (rowBytes % bpp) == 0u) {
+        rowLength = (GLint)(rowBytes / bpp);
+    }
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+    defer {
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glBindTexture(GL_TEXTURE_2D, 0u);
+    }
+
+    GLint internalFmt = uploadGray ? GL_R8 : GL_RGBA8;
+    GLenum format = uploadGray ? GL_RED : GL_RGBA;
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 internalFmt,
+                 (GLsizei)page.pixelWidth,
+                 (GLsizei)page.pixelHeight,
+                 0,
+                 format,
+                 GL_UNSIGNED_BYTE,
+                 pixels);
+
+    slot->texID = tex;
+    slot->texIsGrayscale = uploadGray;
+    slot->mipmapsDirty = true;
+    if (page.isAnimatedGIF) {
+        uint64_t next = UINT64_MAX;
+        slot->gifStartMs = (uint64_t)xsc_now_ms();
+        (void)[page gifFrameAtElapsedMs:0u nextChangeMs:&next];
+        if (next != UINT64_MAX) slot->gifNextMs = slot->gifStartMs + next;
+    }
+}
+
+- (bool)tickSlot:(XSCPageSlot *)slot page:(XSCDecodedPage *)page nowMs:(uint64_t)nowMs {
+    if (!_glReady || !slot->texID || nowMs < slot->gifNextMs || slot->gifNextMs == UINT64_MAX) {
+        return false;
+    }
+    uint64_t next = UINT64_MAX;
+    size_t nextFrame = [page gifFrameAtElapsedMs:nowMs - slot->gifStartMs nextChangeMs:&next];
+    slot->gifNextMs = next < UINT64_MAX - slot->gifStartMs ? slot->gifStartMs + next : UINT64_MAX;
+    if (nextFrame == slot->gifFrame) return false;
+    const uint8_t *framePixels = [page gifFramePixelsAtIndex:nextFrame outDelayMs:NULL];
+
+    GLint rowLength = 0;
+    if (page.bytesPerRow > page.pixelWidth * 4u && (page.bytesPerRow % 4u) == 0u) {
+        rowLength = (GLint)(page.bytesPerRow / 4u);
+    }
+    glBindTexture(GL_TEXTURE_2D, slot->texID);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+    defer {
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glBindTexture(GL_TEXTURE_2D, 0u);
+    }
+
+    glTexSubImage2D(GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    (GLsizei)page.pixelWidth,
+                    (GLsizei)page.pixelHeight,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    framePixels);
+
+    slot->gifFrame = nextFrame;
+    if (!slot->mipmapsDirty) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    slot->mipmapsDirty = true;
+    return true;
+}
+
+- (bool)tickAnimationAtMs:(uint64_t)nowMs {
+    bool leftChanged = [self tickSlot:&_leftSlot page:_leftPage nowMs:nowMs];
+    bool rightChanged = [self tickSlot:&_rightSlot page:_rightPage nowMs:nowMs];
+    return leftChanged || rightChanged;
+}
+
+- (uint64_t)nextAnimationDeadlineMs {
+    uint64_t left = _leftSlot.texID ? _leftSlot.gifNextMs : UINT64_MAX;
+    uint64_t right = _rightSlot.texID ? _rightSlot.gifNextMs : UINT64_MAX;
+    return left < right ? left : right;
+}
+
+#pragma mark - Public State & Layout API
+
+- (void)setViewportRect:(XSCRectF)viewport
+          drawableWidth:(int)drawableW
+         drawableHeight:(int)drawableH
+           backingScale:(float)scale {
+    _viewport = viewport;
+    _drawableW = drawableW > 0 ? drawableW : 1;
+    _drawableH = drawableH > 0 ? drawableH : 1;
+    _backingScale = scale > 0.0f ? scale : 1.0f;
+    [self clampPanOffset];
+}
+
+- (void)displayLeftPage:(XSCOptDecodedPage)leftPageOpt
+              rightPage:(XSCOptDecodedPage)rightPageOpt
+           showEmptyCTA:(bool)showEmptyCTA
+              isLoading:(bool)isLoading
+             statusText:(XSCOptString)statusTextOpt {
+    XSCDecodedPage *leftPage = xsc_unwrap_page(leftPageOpt);
+    XSCDecodedPage *rightPage = xsc_unwrap_page(rightPageOpt);
+    XSCString *statusText = xsc_unwrap_string(statusTextOpt);
+
+    // Layout changes can move a page to the other slot. Carry its texture
+    // and playback clock along so a spread flip does not re-upload or restart.
+    if (_leftPage != leftPage && _rightPage != rightPage &&
+        ((leftPage && leftPage == _rightPage) || (rightPage && rightPage == _leftPage))) {
+        XSCPageSlot slot = _leftSlot;
+        _leftSlot = _rightSlot;
+        _rightSlot = slot;
+        XSCDecodedPage *page = _leftPage;
+        _leftPage = _rightPage;
+        _rightPage = page;
+    }
+
+    if (_leftPage != leftPage) {
+        _leftPage = leftPage;
+        if (_leftPage) {
+            [self uploadSlot:&_leftSlot page:_leftPage];
+        } else {
+            [self releaseTextureForSlot:&_leftSlot];
+        }
+    } else if (_leftPage && _leftSlot.texID == 0u && _glReady) {
+        [self uploadSlot:&_leftSlot page:_leftPage];
+    }
+
+    if (_rightPage != rightPage) {
+        _rightPage = rightPage;
+        if (_rightPage) {
+            [self uploadSlot:&_rightSlot page:_rightPage];
+        } else {
+            [self releaseTextureForSlot:&_rightSlot];
+        }
+    } else if (_rightPage && _rightSlot.texID == 0u && _glReady) {
+        [self uploadSlot:&_rightSlot page:_rightPage];
+    }
+
+    _showEmptyCTA = showEmptyCTA;
+    _isLoading = isLoading;
+    _statusText = statusText;
+    [self clampPanOffset];
+}
+
+- (float)computeFitScale {
+    float availW = fmaxf(1.0f, _viewport.width - 2.0f * kXSCCanvasInset);
+    float availH = fmaxf(1.0f, _viewport.height - 2.0f * kXSCCanvasInset);
+
+    if (!_leftPage && !_rightPage) {
+        return 1.0f;
+    }
+    if (_leftPage && _rightPage) {
+        XSCSizeF ls = _leftPage.orientedPixelSize;
+        XSCSizeF rs = _rightPage.orientedPixelSize;
+        float totalW = fmaxf(1.0f, ls.width + rs.width);
+        float maxH = fmaxf(1.0f, fmaxf(ls.height, rs.height));
+        float usableW = fmaxf(1.0f, availW - kXSCPageSpacing);
+        return fminf(usableW / totalW, availH / maxH);
+    }
+    XSCDecodedPage *single = _leftPage ? _leftPage : _rightPage;
+    XSCSizeF s = single.orientedPixelSize;
+    return fminf(availW / fmaxf(1.0f, s.width), availH / fmaxf(1.0f, s.height));
+}
+
+- (float)zoomScale {
+    if (_zoomMode == XSCZoomModeCustom) {
+        return _customScale;
+    }
+    return [self computeFitScale];
+}
+
+- (void)computeLeftRect:(XSCRectF *)outLeft
+              rightRect:(XSCRectF *)outRight
+             totalWidth:(float *)outTotalW
+            totalHeight:(float *)outTotalH {
+    float scale = self.zoomScale;
+    XSCRectF leftR = { 0.0f, 0.0f, 0.0f, 0.0f };
+    XSCRectF rightR = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float totalW = 0.0f;
+    float totalH = 0.0f;
+
+    if (_leftPage && _rightPage) {
+        XSCSizeF ls = _leftPage.orientedPixelSize;
+        XSCSizeF rs = _rightPage.orientedPixelSize;
+        float lw = ls.width * scale;
+        float lh = ls.height * scale;
+        float rw = rs.width * scale;
+        float rh = rs.height * scale;
+        totalW = lw + kXSCPageSpacing + rw;
+        totalH = fmaxf(lh, rh);
+        float cx = _viewport.width * 0.5f + _panOffsetX;
+        float cy = _viewport.height * 0.5f + _panOffsetY;
+        float startX = cx - totalW * 0.5f;
+        leftR = (XSCRectF){ startX, cy - lh * 0.5f, lw, lh };
+        rightR = (XSCRectF){ startX + lw + kXSCPageSpacing, cy - rh * 0.5f, rw, rh };
+    } else if (_leftPage || _rightPage) {
+        XSCDecodedPage *p = _leftPage ? _leftPage : _rightPage;
+        XSCSizeF s = p.orientedPixelSize;
+        float pw = s.width * scale;
+        float ph = s.height * scale;
+        totalW = pw;
+        totalH = ph;
+        float cx = _viewport.width * 0.5f + _panOffsetX;
+        float cy = _viewport.height * 0.5f + _panOffsetY;
+        XSCRectF r = { cx - pw * 0.5f, cy - ph * 0.5f, pw, ph };
+        if (_leftPage) {
+            leftR = r;
+        } else {
+            rightR = r;
+        }
+    }
+
+    if (outLeft) *outLeft = leftR;
+    if (outRight) *outRight = rightR;
+    if (outTotalW) *outTotalW = totalW;
+    if (outTotalH) *outTotalH = totalH;
+}
+
+- (void)clampPanOffset {
+    if (_zoomMode == XSCZoomModeFit) {
+        _panOffsetX = 0.0f;
+        _panOffsetY = 0.0f;
+        return;
+    }
+    float totalW = 0.0f;
+    float totalH = 0.0f;
+    [self computeLeftRect:NULL rightRect:NULL totalWidth:&totalW totalHeight:&totalH];
+    float maxX = fmaxf(0.0f, (totalW - _viewport.width) * 0.5f + kXSCCanvasInset);
+    float maxY = fmaxf(0.0f, (totalH - _viewport.height) * 0.5f + kXSCCanvasInset);
+    _panOffsetX = fminf(maxX, fmaxf(-maxX, _panOffsetX));
+    _panOffsetY = fminf(maxY, fmaxf(-maxY, _panOffsetY));
+}
+
+- (void)notifyZoomChanged {
+    if (_onZoomChanged) {
+        _onZoomChanged(_zoomMode, self.zoomScale);
+    }
+}
+
+- (void)setFitMode {
+    _zoomMode = XSCZoomModeFit;
+    _panOffsetX = 0.0f;
+    _panOffsetY = 0.0f;
+    [self notifyZoomChanged];
+}
+
+- (void)setCustomScale:(float)scale {
+    if (!isfinite(scale) || scale <= 0.0f) {
+        return;
+    }
+    float clamped = fminf(kXSCMaxZoomScale, fmaxf(kXSCMinZoomScale, scale));
+    _zoomMode = XSCZoomModeCustom;
+    _customScale = clamped;
+    [self clampPanOffset];
+    [self notifyZoomChanged];
+}
+
+- (void)adjustZoomByFactor:(float)factor {
+    if (!isfinite(factor) || factor <= 0.0f) {
+        return;
+    }
+    float base = (_zoomMode == XSCZoomModeCustom) ? _customScale : [self computeFitScale];
+    [self setCustomScale:base * factor];
+}
+
+- (void)zoomAroundPointX:(float)px y:(float)py factor:(float)factor {
+    if ((!_leftPage && !_rightPage) || !isfinite(factor)) {
+        return;
+    }
+    if (factor <= 0.05f) {
+        factor = 0.05f;
+    }
+    if (_zoomMode == XSCZoomModeFit) {
+        _customScale = [self computeFitScale];
+        _zoomMode = XSCZoomModeCustom;
+        _panOffsetX = 0.0f;
+        _panOffsetY = 0.0f;
+    }
+    float oldScale = _customScale;
+    float newScale = fminf(kXSCMaxZoomScale, fmaxf(kXSCMinZoomScale, oldScale * factor));
+    if (fabsf(newScale - oldScale) < 1e-5f) {
+        return;
+    }
+
+    // Keep the point under the cursor stationary in canvas-local top-left coordinates.
+    float dx = px - _viewport.width * 0.5f;
+    float dy = py - _viewport.height * 0.5f;
+    float ratio = newScale / oldScale;
+
+    _customScale = newScale;
+    _panOffsetX = dx - (dx - _panOffsetX) * ratio;
+    _panOffsetY = dy - (dy - _panOffsetY) * ratio;
+
+    [self clampPanOffset];
+    [self notifyZoomChanged];
+}
+
+- (void)panByDeltaX:(float)dx deltaY:(float)dy {
+    if (_zoomMode != XSCZoomModeCustom) {
+        return;
+    }
+    _panOffsetX += dx;
+    _panOffsetY += dy;
+    [self clampPanOffset];
+}
+
+- (void)resetPan {
+    _panOffsetX = 0.0f;
+    _panOffsetY = 0.0f;
+}
+
+#pragma mark - OpenGL Rendering
+
+- (void)drawQuadForPage:(XSCDecodedPage *)page
+                   slot:(XSCPageSlot *)slot
+                   rect:(XSCRectF)rect {
+    if (!page || slot->texID == 0u || rect.width < 0.5f || rect.height < 0.5f) {
+        return;
+    }
+    if (_viewport.width < 1.0f || _viewport.height < 1.0f) {
+        return;
+    }
+
+    // Convert canvas-local top-left-origin rect into OpenGL NDC [-1, 1] (y up).
+    float ndcLeft   = (rect.x / _viewport.width) * 2.0f - 1.0f;
+    float ndcRight  = ((rect.x + rect.width) / _viewport.width) * 2.0f - 1.0f;
+    float ndcTop    = 1.0f - (rect.y / _viewport.height) * 2.0f;
+    float ndcBottom = 1.0f - ((rect.y + rect.height) / _viewport.height) * 2.0f;
+
+    float dstW = rect.width * _backingScale;
+    float dstH = rect.height * _backingScale;
+    _gl.uniform4f(_uRectLoc, ndcLeft, ndcBottom, ndcRight, ndcTop);
+    _gl.uniform2f(_uTexSizeLoc, (float)page.pixelWidth, (float)page.pixelHeight);
+    _gl.uniform2f(_uDstSizeLoc, dstW, dstH);
+    _gl.uniform1i(_uOrientationLoc, (GLint)page.exifOrientation);
+    _gl.uniform1i(_uIsGrayscaleLoc, slot->texIsGrayscale ? 1 : 0);
+
+    _gl.activeTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, slot->texID);
+    XSCSizeF pixels = page.orientedPixelSize;
+    float safeW = fmaxf(1.0f, dstW);
+    float safeH = fmaxf(1.0f, dstH);
+    if (slot->mipmapsDirty && (pixels.width / safeW > 2.95f || pixels.height / safeH > 2.95f)) {
+        _gl.generateMipmap(GL_TEXTURE_2D);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        slot->mipmapsDirty = false;
+    }
+    _gl.uniform1i(_uTexLoc, 0);
+
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+- (void)render {
+    if (!_glReady || _viewport.width < 1.0f || _viewport.height < 1.0f) {
+        return;
+    }
+
+    // Lazy upload if textures were flagged dirty before GL initialization.
+    if (_leftPage && _leftSlot.texDirty) {
+        [self uploadSlot:&_leftSlot page:_leftPage];
+    }
+    if (_rightPage && _rightSlot.texDirty) {
+        [self uploadSlot:&_rightSlot page:_rightPage];
+    }
+
+    GLint leftPx  = (GLint)lroundf(_viewport.x * _backingScale);
+    GLint rightPx = (GLint)lroundf((_viewport.x + _viewport.width) * _backingScale);
+    GLint topPx   = (GLint)lroundf(_viewport.y * _backingScale);
+    GLint botPx   = (GLint)lroundf((_viewport.y + _viewport.height) * _backingScale);
+
+    GLsizei glW = rightPx - leftPx;
+    GLsizei glH = botPx - topPx;
+    GLint glX = leftPx;
+    GLint glY = _drawableH - botPx;
+
+    if (glW <= 0 || glH <= 0) {
+        return;
+    }
+
+    glEnable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    defer {
+        glDisable(GL_SCISSOR_TEST);
+        glBindTexture(GL_TEXTURE_2D, 0u);
+        _gl.bindVertexArray(0u);
+        _gl.useProgram(0u);
+    }
+
+    glViewport(glX, glY, glW, glH);
+    glScissor(glX, glY, glW, glH);
+
+    if (!_leftPage && !_rightPage) {
+        return;
+    }
+
+    XSCRectF leftR = { 0.0f, 0.0f, 0.0f, 0.0f };
+    XSCRectF rightR = { 0.0f, 0.0f, 0.0f, 0.0f };
+    [self computeLeftRect:&leftR rightRect:&rightR totalWidth:NULL totalHeight:NULL];
+
+    _gl.useProgram(_program);
+    _gl.bindVertexArray(_vao);
+
+    if (_leftPage && _leftSlot.texID != 0u) {
+        [self drawQuadForPage:_leftPage slot:&_leftSlot rect:leftR];
+    }
+    if (_rightPage && _rightSlot.texID != 0u) {
+        [self drawQuadForPage:_rightPage slot:&_rightSlot rect:rightR];
+    }
+}
+
+@end

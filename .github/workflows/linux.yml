@@ -1,0 +1,67 @@
+name: Linux
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xscomic-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-24.04
+          - arch: AArch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build pinned SDK image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          load: true
+          tags: xscomic-objc3:dev
+          cache-from: type=gha,scope=xscomic-${{ matrix.arch }}
+          cache-to: type=gha,scope=xscomic-${{ matrix.arch }},mode=min,ignore-error=true
+      - name: Run release smoke and core checks in parallel
+        run: |
+          set -o pipefail
+          mkdir -p build/ci
+          (
+            ./scripts/docker-env.sh ./scripts/build-linux.sh --release &&
+            ./scripts/docker-env.sh xvfb-run -a python3 Tests/xsComicLinuxTests/smoke.py build/linux/xscomic --x11
+          ) > build/ci/render-and-interaction.log 2>&1 &
+          smoke=$!
+          ./scripts/docker-env.sh ./scripts/run-linux-tests.sh > build/ci/core.log 2>&1 &
+          core=$!
+
+          status=0
+          for pid in "$smoke" "$core"; do
+            if ! wait "$pid"; then status=1; fi
+          done
+          for log in build/ci/*.log; do
+            printf '::group::%s\n' "$log"
+            cat "$log"
+            printf '::endgroup::\n'
+          done
+          exit "$status"
+      - name: Preserve check logs
+        if: "!cancelled()"
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-logs
+          path: build/ci/*.log

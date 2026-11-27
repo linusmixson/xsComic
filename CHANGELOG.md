@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased — Linux Slopjective-C (Objective-C 3.0) Port
+
+Added a native Linux (`aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu`,
+Debian 13) Objective-C 3.0 port in `Sources/xsComicLinux/` alongside the intact
+macOS Objective-C / AppKit / Metal application (`Sources/xsComic/`,
+`Tests/xsComicTests/`, `scripts/build-app.sh`, `scripts/run-tests.sh`,
+`scripts/build-and-run.sh`, and `docs/guide.md` remain unchanged):
+
+- added `Sources/xsComicLinux/XSCBase.{h,objc3}`: minimal
+  `__attribute__((objc_root_class))` ARC root class (`XSCObject`) targeting the
+  Slopjective-C `objc3c` (`v0.1.0-preview.1`, patched Clang 23.1.5, GNUstep 2.2
+  ABI + `libobjc2`, zero GNUstep-Base) runtime, with `XSCString`, `XSCData`,
+  `XSCError <Error>`, `XSCIndexList`, main-thread queue/timer dispatcher with
+  event-loop wakeup hook, and background pthread pool; uses Objective-C 3.0
+  `defer`, `Optional(T)`, `Result(T, E)`, exhaustive `match`, typed
+  `throws(XSCError *)`, `tryValue` / `tryOptional`, and `handle` / `catch`;
+- added `Sources/xsComicLinux/XSCArchive.{h,objc3}`: POSIX + `zlib` raw-DEFLATE
+  + `libarchive` reader with zero-extraction `pread(2)` CBZ/ZIP (STORE,
+  raw-DEFLATE, Zip64, CRC-32 validation) and CBT/TAR (ustar/PAX/GNU LongName).
+  The libarchive reader caps temporary spill per book and across the process.
+  Directory books stay anchored to an open directory, with no-follow traversal,
+  natural sorting, and adjacent-volume discovery.
+- added `Sources/xsComicLinux/XSCImageStore.{h,objc3}`: native Linux decoders
+  (`libjpeg-turbo`, `libpng`, `libwebp`, `giflib` with multi-frame composited
+  animated GIFs, `libtiff`, `libavif`, `libheif`, built-in BMP), EXIF 1–8
+  orientation parsing, straight-alpha TIFF output, and lossless 8-bit
+  grayscale repacking. A bounded 12-entry, 64 MiB cache uses page-owned pixel
+  mappings, request coalescing, and a four-lane priority decode pool.
+- added `Sources/xsComicLinux/XSCReaderModel.{h,objc3}`: archive-order
+  single/two-page LTR/RTL navigation, 8-ahead/2-behind + 2-turn backward
+  prefetch predictor, zero-hop synchronous cache-hit fast path, 120 ms loading
+  grace timer, and predictive adjacent-volume pre-warming;
+- added `Sources/xsComicLinux/XSCGLCanvas.{h,objc3}` and
+  `Sources/xsComicLinux/main.objc3`: SDL2 + OpenGL 3.3 Core + `SDL2_ttf`
+  dark-chrome desktop shell with inline GLSL 330 hybrid Lanczos-3 (`1.05×–3×`)
+  + lazy trilinear mipmap (`>3×`) downscaling, premultiplied alpha uploads,
+  EXIF 1–8 orientation, `GL_R8` `.rrr1` swizzling, focal-point zoom, drag
+  panning, deadline-driven animated GIF playback with spread-slot reuse,
+  toolbar, collapsible page sidebar, empty CTA, direct Jump-to-Page modal
+  (`Ctrl+Shift+G` / `G`), XDG-persisted settings popover (`prefs.ini`),
+  drag-and-drop, a cancellable file picker, and deterministic `--screenshot`
+  capture with distinct usage and rendering failure statuses;
+- added Debian 13 + pinned Slopjective-C SDK Docker toolchain
+  (`docker/Dockerfile`, `scripts/docker-env.sh`), disjoint native-or-Docker
+  Linux scripts (`scripts/build-linux.sh`, `scripts/run-linux-tests.sh`,
+  `scripts/build-and-run-linux.sh`), experimental Darwin Objective-C 3 SDK
+  qualification harness (`scripts/run-objc3-macos-tests.sh`), Linux `x86-64` /
+  `AArch64` and macOS `arm64` GitHub Actions workflows (`.github/workflows/`),
+  a 191-assertion core test & benchmark suite (`Tests/xsComicLinuxTests/main.objc3`),
+  an E2E rendered-pixel and X11 interaction smoke suite
+  (`Tests/xsComicLinuxTests/smoke.py`), Linux architecture documentation
+  (`docs/linux.md`), and a reproducible audit record (`Metrics/linux-objc3.json`);
+- verified Debian 13 `aarch64` release (`-Oz -flto=thin -Wl,--gc-sections
+  -Wl,--as-needed` + `strip`) footprint, sanitizers, E2E smoke checks, and
+  benchmarks: **289.3 KiB (296,272 bytes)** stripped `build/linux/xscomic` (16
+  direct shared libraries, 0 unused), `191 passed, 0 failed` (ASan + UBSan +
+  LSan and TSan 3/3 clean), full `smoke.py --x11` pass, 1.16 ms median
+  4,096-file dir scan, 0.024 ms median 128-page CBZ open, 0.062 ms median
+  500-page CBZ open, 3.28 ms median cold 1024×1536 JPEG decode, 43.3 ns/call
+  median synchronous cache-hit lookup, and 97.2 ms median cold CBZ
+  launch-to-render on Mesa llvmpipe.
+
 ## 2.0.0
 
 Apple Silicon (`arm64`, macOS 14+) rewrite in Objective-C, AppKit, and Metal:

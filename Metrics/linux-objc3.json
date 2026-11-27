@@ -1,0 +1,356 @@
+{
+  "schema_version": 1,
+  "label": "linux-objc3",
+  "measurement_kind": "linux_objc3_release_audit",
+  "measured_at": "2026-11-27T09:57:55Z",
+  "environment": {
+    "host_os": "macOS 27.0.1 (26A434)",
+    "host_cpu": "Apple M5 Pro",
+    "host_architecture": "arm64",
+    "container_image": "xscomic-objc3:dev",
+    "container_os": "Debian GNU/Linux 13 (trixie)",
+    "container_kernel": "Linux 7.0.12-linuxkit aarch64",
+    "target_triple": "aarch64-unknown-linux-gnu",
+    "compiler": "Slopjective-C objc3c v0.1.0-preview.1",
+    "objc3c_frontend_hash": "2109704150a84dddbd4639529a9b161f0a20146ca6550abcd371cc4fc0d03b68",
+    "clang": "23.1.5 (llvm 392dfff97d29b59d77e5cac6d4b6ef2585fe7117)",
+    "objc_runtime": "GNUstep 2.2 ABI (libobjc.so.4.6, zero GNUstep-Base)",
+    "opengl_headless_renderer": "llvmpipe (LLVM 19.1.7, 128 bits), OpenGL 4.5 (Core Profile) Mesa 25.0.7-2+deb13u1"
+  },
+  "source": {
+    "digest_schema": "cbr-source-digest-v7",
+    "sha256": "5561efa7b3ea2cbb65aee356d98c1cc98c27f22292652af00537e5c58b8d9164"
+  },
+  "production_source": {
+    "objc3_files": 6,
+    "header_files": 5,
+    "objc3_lines": 11339,
+    "header_lines": 500,
+    "total_lines": 11839,
+    "total_bytes": 425395
+  },
+  "test_source": {
+    "objc3_files": 1,
+    "objc3_lines": 2653,
+    "objc3_bytes": 118299,
+    "smoke_py_lines": 301,
+    "smoke_py_bytes": 13888
+  },
+  "build": {
+    "release_flags": "-std=c17 -D_GNU_SOURCE -Wall -Wextra -Werror -Oz -ffunction-sections -fdata-sections -flto=thin -Wl,--gc-sections -Wl,--as-needed + strip --strip-all",
+    "debug_flags": "-std=c17 -D_GNU_SOURCE -Wall -Wextra -Werror -O0 -g -Wl,--as-needed",
+    "clean_release_build_seconds": 1.858,
+    "output_path": "build/linux/xscomic",
+    "symbols_path": "build/linux/xscomic.symbols"
+  },
+  "correctness": {
+    "suite": "./scripts/run-linux-tests.sh",
+    "runs": 3,
+    "assertions_passed": 191,
+    "assertions_failed": 0,
+    "smoke_e2e": "xvfb-run -a python3 Tests/xsComicLinuxTests/smoke.py build/linux/xscomic --x11 (CLI, 8 TIFF orientations, alpha-edge premultiply, 2x Lanczos-3 bars, 0.125x mipmap checker, interlaced GIF, sparse color/alpha, X11 picker/reap, one-shot GIF, jump modal: all passed)",
+    "sanitizers": {
+      "asan_ubsan_lsan": "191 passed, 0 failed, 0 leaks, 0 errors",
+      "tsan": "191 passed, 0 failed (3/3 runs), 0 data races, 0 lock-order inversions"
+    }
+  },
+  "benchmarks": {
+    "runs": 3,
+    "archive_scan_4096": {
+      "page_count": 4096,
+      "median_ms": 1.16,
+      "fastest_ms": 1.15,
+      "slowest_ms": 1.16,
+      "samples_ms": [
+        1.15,
+        1.16,
+        1.16
+      ]
+    },
+    "cbz_open_128": {
+      "page_count": 128,
+      "median_ms": 0.024,
+      "fastest_ms": 0.023,
+      "slowest_ms": 0.027,
+      "samples_ms": [
+        0.024,
+        0.027,
+        0.023
+      ]
+    },
+    "cbz_open_500": {
+      "page_count": 500,
+      "median_ms": 0.062,
+      "fastest_ms": 0.056,
+      "slowest_ms": 0.066,
+      "samples_ms": [
+        0.056,
+        0.062,
+        0.066
+      ]
+    },
+    "cold_jpeg_decode": {
+      "width": 1024,
+      "height": 1536,
+      "median_ms": 3.28,
+      "fastest_ms": 2.97,
+      "slowest_ms": 3.36,
+      "samples_ms": [
+        3.36,
+        3.28,
+        2.97
+      ]
+    },
+    "sync_cache_hit_lookup": {
+      "iterations": 10000,
+      "median_ns_per_call": 43.3,
+      "fastest_ns_per_call": 42.3,
+      "slowest_ns_per_call": 45.5,
+      "samples_ns_per_call": [
+        42.3,
+        45.5,
+        43.3
+      ]
+    },
+    "test_process_rss": {
+      "source": "/proc/self/statm",
+      "median_mib": 42.64,
+      "median_bytes": 44716032,
+      "lowest_mib": 42.64,
+      "lowest_bytes": 44711936,
+      "highest_mib": 42.71,
+      "highest_bytes": 44789760
+    }
+  },
+  "cold_launch_to_render": {
+    "resolution": "1280x800",
+    "renderer": "Mesa llvmpipe software OpenGL 3.3 Core (LIBGL_ALWAYS_SOFTWARE=1)",
+    "samples_per_mode": 5,
+    "cbz_10p_1024x1536_direct_xvfb": {
+      "description": "Cold process launch -> SDL2/GL init -> CBZ open -> page 1 JPEG decode -> GL render -> PNG write against running Xvfb display",
+      "median_ms": 97.23,
+      "fastest_ms": 76.09,
+      "slowest_ms": 230.25,
+      "samples_ms": [
+        230.25,
+        134.55,
+        97.23,
+        76.23,
+        76.09
+      ]
+    },
+    "cbz_10p_1024x1536_via_xvfb_run": {
+      "description": "End-to-end including xvfb-run Xvfb server startup and teardown",
+      "median_ms": 95.15,
+      "fastest_ms": 95.05,
+      "slowest_ms": 97.66,
+      "samples_ms": [
+        97.66,
+        95.15,
+        95.14,
+        95.05,
+        95.75
+      ]
+    },
+    "empty_state_direct_xvfb": {
+      "description": "Empty reader screenshot against running Xvfb display",
+      "median_ms": 65.29,
+      "fastest_ms": 64.79,
+      "slowest_ms": 84.9,
+      "samples_ms": [
+        84.9,
+        65.29,
+        64.79,
+        65.17,
+        66.01
+      ]
+    },
+    "empty_state_via_xvfb_run": {
+      "description": "Empty reader screenshot including xvfb-run startup and teardown",
+      "median_ms": 83.7,
+      "fastest_ms": 83.52,
+      "slowest_ms": 84.31,
+      "samples_ms": [
+        83.52,
+        83.7,
+        83.86,
+        83.66,
+        84.31
+      ]
+    }
+  },
+  "footprint": {
+    "stripped_executable_bytes": 296272,
+    "stripped_executable_kib": 289.3,
+    "retained_symbol_executable_bytes": 457832,
+    "retained_symbol_executable_kib": 447.1,
+    "debug_executable_bytes": 909984,
+    "debug_executable_kib": 888.7,
+    "elf_format": "ELF64 AArch64 PIE (DYN)",
+    "size_berkeley": {
+      "text_bytes": 264715,
+      "data_bytes": 27588,
+      "bss_bytes": 8000,
+      "total_dec_bytes": 300303
+    },
+    "elf_sections_bytes": {
+      ".text": 128252,
+      ".rela.dyn": 49536,
+      ".rodata": 27372,
+      ".eh_frame": 22648,
+      ".data": 20020,
+      ".dynsym": 7056,
+      ".eh_frame_hdr": 6900,
+      ".rela.plt": 6816,
+      ".gcc_except_table": 5436,
+      ".dynstr": 5064,
+      ".bss": 4640,
+      ".plt": 4576,
+      "__objc_metadata_total": 3720,
+      ".relro_padding": 3360,
+      "__objc_selectors": 3072,
+      ".got.plt": 2296,
+      ".data.rel.ro": 752,
+      ".dynamic": 672,
+      ".gnu.version": 588,
+      ".comment": 467,
+      ".shstrtab": 414,
+      ".gnu.version_r": 320,
+      "__objc_protocols": 264,
+      "__objc_class_refs": 136,
+      "__objc_classes": 136,
+      ".got": 88,
+      "__objc_cats": 56,
+      ".gnu.hash": 40,
+      ".note.ABI-tag": 32,
+      ".init_array": 32,
+      "__objc_constant_string": 32,
+      ".init": 28,
+      ".interp": 27,
+      ".fini": 24,
+      "__objc_class_aliases": 16,
+      ".fini_array": 8,
+      "__objc_protocol_refs": 8
+    },
+    "top_15_symbols": [
+      {
+        "name": "XSCDecodeWorkerMain",
+        "type": "t",
+        "bytes": 7004
+      },
+      {
+        "name": "_i_XSCAppController__drawToolbarFull",
+        "type": "t",
+        "bytes": 5904
+      },
+      {
+        "name": "_c_XSCBook__openLibarchiveAtPath_sourcePath_cancelFlag_",
+        "type": "t",
+        "bytes": 4208
+      },
+      {
+        "name": "gSpillRoot",
+        "type": "b",
+        "bytes": 4096
+      },
+      {
+        "name": "_i_XSCBook__readPageDataAtIndex_",
+        "type": "t",
+        "bytes": 3276
+      },
+      {
+        "name": "_c_XSCBook__openTarAtPath_sourcePath_cancelFlag_",
+        "type": "t",
+        "bytes": 3220
+      },
+      {
+        "name": "_c_XSCBook__openZipAtPath_sourcePath_cancelFlag_",
+        "type": "t",
+        "bytes": 3188
+      },
+      {
+        "name": "main",
+        "type": "T",
+        "bytes": 3096
+      },
+      {
+        "name": "XSCStoreFinishDecode",
+        "type": "t",
+        "bytes": 2616
+      },
+      {
+        "name": "_i_XSCReaderModel__presentCurrentSpreadWithContinueAcrossVolumes_",
+        "type": "t",
+        "bytes": 2588
+      },
+      {
+        "name": "_i_XSCAppController__syncWindowMetrics",
+        "type": "t",
+        "bytes": 2044
+      },
+      {
+        "name": "_i_XSCAppController__drawSidebar",
+        "type": "t",
+        "bytes": 1884
+      },
+      {
+        "name": "_i_XSCAppController__handleMouseDownX_y_button_",
+        "type": "t",
+        "bytes": 1880
+      },
+      {
+        "name": "_i_XSCAppController__drawJumpModal",
+        "type": "t",
+        "bytes": 1860
+      },
+      {
+        "name": "_c_XSCBook__adjacentVolumePathFor_step_cancelFlag_",
+        "type": "t",
+        "bytes": 1788
+      }
+    ],
+    "dynamic_dependencies": {
+      "direct_needed_count": 16,
+      "unused_direct_dependencies": 0,
+      "trimmed_by_as_needed": [
+        "libEGL.so.1",
+        "libstdc++.so.6"
+      ],
+      "transitive_ldd_entries": 105,
+      "direct_needed": [
+        "libz.so.1",
+        "libarchive.so.13",
+        "libjpeg.so.62",
+        "libpng16.so.16",
+        "libwebp.so.7",
+        "libgif.so.7",
+        "libtiff.so.6",
+        "libavif.so.16",
+        "libheif.so.1",
+        "libSDL2-2.0.so.0",
+        "libSDL2_ttf-2.0.so.0",
+        "libGL.so.1",
+        "libm.so.6",
+        "libobjc.so.4.6",
+        "libgcc_s.so.1",
+        "libc.so.6"
+      ]
+    }
+  },
+  "sha256": {
+    "stripped_executable": "c9708294b8616398fa79d8e9c5a50e831ed54932dbbc96be75d72741feb7173e",
+    "retained_symbol_executable": "76c0509d3731b6dd3f671fbc577ae52168f7534511ee9773dbaddf81e2923ee1"
+  },
+  "runtime_policy": {
+    "image_loading": "off-main 4-lane priority pthread pool (3 prefetch max, 1 reserved for visible demand)",
+    "image_cache_limit_bytes": 67108864,
+    "image_cache_entry_limit": 12,
+    "pixel_buffer_backing": "page-owned anonymous mmap (released deterministically on page dealloc)",
+    "grayscale_optimization": "direct L8 decode for native monochrome JPEG/PNG + exact lossless RGBA8-to-L8 repack",
+    "gpu_downscaling": "hybrid 6x6 separable Lanczos-3 (1.05x-3x) + lazy trilinear mipmaps (>3x), premultiplied alpha uploads",
+    "forward_prefetch_pages": 8,
+    "backward_buffer_pages": 2,
+    "adjacent_volume_prewarm_margin_pages": 3,
+    "loading_grace_ms": 120
+  }
+}

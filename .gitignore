@@ -14,6 +14,8 @@ DerivedData/
 
 # Local build and distribution products
 build/
+__pycache__/
+*.pyc
 
 # Editor and tool state
 .codex/
@@ -50,3 +52,4 @@ Metrics/*.json
 !Metrics/release-x86_64.json
 !Metrics/release-arm64.json
 !Metrics/dmg.json
+!Metrics/linux-objc3.json

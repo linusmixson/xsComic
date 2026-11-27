@@ -1,0 +1,3174 @@
+/*
+ XSCImageStore.objc3 — Bounded, concurrent image decode store for Linux.
+
+ Architecture & Memory Strategy:
+   1. Zero-hop synchronous fast path: `cachedPageForBook:index:` acquires an
+      uncontended `pthread_mutex_t`, probes a compact open-addressed C hash table
+      (zero Foundation dictionary overhead), and
+      returns `Optional(XSCDecodedPage *)` on the calling thread.
+   2. Native Linux codecs: libjpeg-turbo (`JCS_GRAYSCALE` & `JCS_EXT_RGBA`),
+      libpng, libwebp, giflib (static + full multi-frame composited animated GIF),
+      libtiff (in-memory `TIFFClientOpen`), built-in zero-dep 24/32-bit BMP,
+      libavif, and libheif — with EXIF 1..8 orientation parsing and 16,384 px
+      texture dimension enforcement.
+   3. Opaque monochrome JPEG/PNG sources decode directly into 8-bit L8.
+      Other static pages are repacked only when every pixel is opaque and gray.
+   4. Pixel mappings remain valid for the lifetime of each decoded page.
+      Eviction releases the mapping as soon as its last owner drops it.
+   5. 4-lane priority pthread decode pool: 4 worker threads with background
+      prefetch/prewarm capped at 3 active lanes, reserving 1 lane at all times
+      for visible demand (`priority == true`).
+ */
+
+#include "XSCImageStore.h"
+
+#include <limits.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <avif/avif.h>
+#include <gif_lib.h>
+#include <jpeglib.h>
+#include <jerror.h>
+#include <libheif/heif.h>
+#include <png.h>
+#include <tiffio.h>
+#include <webp/decode.h>
+
+static const size_t kXSCDefaultMaxEntries = 12u;
+static const size_t kXSCDefaultMaxBytes = 64u * 1024u * 1024u;
+static const size_t kXSCMaxTextureDimension = 16384u;
+static const size_t kXSCMaxSourceDimension = 65536u;
+static const uint64_t kXSCMaxSourcePixels = 256ULL * 1024ULL * 1024ULL;
+static const size_t kXSCMaxDecodedAllocBytes = 256u * 1024u * 1024u;
+static const size_t kXSCMaxGIFFrames = 2048u;
+static const int kXSCDecodeWorkerCount = 4;
+static const int kXSCDecodeMaxBackgroundActive = 3;
+
+static inline bool XSCSourceDimensionsAllowed(size_t w, size_t h) {
+    if (w == 0u || h == 0u || w > kXSCMaxSourceDimension || h > kXSCMaxSourceDimension) {
+        return false;
+    }
+    return (uint64_t)w <= kXSCMaxSourcePixels / (uint64_t)h;
+}
+
+typedef Result(XSCDecodedPage *, XSCError *) XSCDecodeResult;
+
+static inline uint64_t XSCPageCacheKey(uint64_t bookID, size_t index) {
+    return (bookID << 32) | ((uint64_t)index & 0xFFFFFFFFull);
+}
+
+static inline size_t XSCAlign64(size_t value) {
+    return (value + 63u) & ~(size_t)63u;
+}
+
+static inline uint64_t XSCHashU64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+static inline size_t XSCNextPow2(size_t v) {
+    size_t p = 16u;
+    while (p < v && p <= (SIZE_MAX >> 1)) {
+        p <<= 1;
+    }
+    return p;
+}
+
+static inline size_t XSCComputeDownsampleStride(size_t w, size_t h) {
+    size_t maxDim = (w > h) ? w : h;
+    if (maxDim <= kXSCMaxTextureDimension) {
+        return 1u;
+    }
+    return (maxDim + kXSCMaxTextureDimension - 1u) / kXSCMaxTextureDimension;
+}
+
+static size_t XSCSystemPageSize(void) {
+    static _Atomic(size_t) gPageSize = 0u;
+    size_t ps = atomic_load_explicit(&gPageSize, memory_order_relaxed);
+    if (ps == 0u) {
+        long sc = sysconf(_SC_PAGESIZE);
+        ps = (sc > 0) ? (size_t)sc : 4096u;
+        atomic_store_explicit(&gPageSize, ps, memory_order_relaxed);
+    }
+    return ps;
+}
+
+typedef struct XSCMmapBuffer {
+    uint8_t *ptr;
+    size_t allocSize;
+    size_t bytesPerRow;
+    size_t logicalSize;
+} XSCMmapBuffer;
+
+static void XSCMmapFree(XSCMmapBuffer *buf) {
+    if (buf && buf->ptr && buf->allocSize > 0u) {
+        munmap(buf->ptr, buf->allocSize);
+    }
+    if (buf) {
+        buf->ptr = NULL;
+        buf->allocSize = 0u;
+        buf->bytesPerRow = 0u;
+        buf->logicalSize = 0u;
+    }
+}
+
+static bool XSCMmapAllocFrames(size_t width,
+                               size_t height,
+                               size_t bytesPerPixel,
+                               size_t frameCount,
+                               XSCMmapBuffer *outBuf) {
+    if (!outBuf) return false;
+    outBuf->ptr = NULL;
+    outBuf->allocSize = 0u;
+    outBuf->bytesPerRow = 0u;
+    outBuf->logicalSize = 0u;
+
+    if (width == 0u || height == 0u || bytesPerPixel == 0u || frameCount == 0u) {
+        return false;
+    }
+    if (width > kXSCMaxTextureDimension || height > kXSCMaxTextureDimension) {
+        return false;
+    }
+    if (width > (SIZE_MAX - 63u) / bytesPerPixel) {
+        return false;
+    }
+    size_t bpr = XSCAlign64(width * bytesPerPixel);
+    if (bpr > SIZE_MAX / height) {
+        return false;
+    }
+    size_t frameBytes = bpr * height;
+    if (frameBytes > kXSCMaxDecodedAllocBytes / frameCount) {
+        return false;
+    }
+    size_t logicalSize = frameBytes * frameCount;
+    size_t pageSize = XSCSystemPageSize();
+    if (logicalSize > SIZE_MAX - pageSize) {
+        return false;
+    }
+    size_t allocSize = (logicalSize + pageSize - 1u) & ~(pageSize - 1u);
+    void *mem = mmap(NULL, allocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        return false;
+    }
+    outBuf->ptr = (uint8_t *)mem;
+    outBuf->allocSize = allocSize;
+    outBuf->bytesPerRow = bpr;
+    outBuf->logicalSize = logicalSize;
+    return true;
+}
+
+static inline bool XSCMmapAlloc(size_t width, size_t height, size_t bytesPerPixel, XSCMmapBuffer *outBuf) {
+    return XSCMmapAllocFrames(width, height, bytesPerPixel, 1u, outBuf);
+}
+
+static bool XSCRGBAIsOpaqueGrayscale(const uint8_t *base, size_t width, size_t height,
+                                     size_t bytesPerRow) {
+    for (size_t y = 0u; y < height; y++) {
+        const uint8_t *row = base + y * bytesPerRow;
+        for (size_t x = 0u; x < width; x++) {
+            const uint8_t *p = row + x * 4u;
+            if (p[3] != 255u || p[0] != p[1] || p[1] != p[2]) return false;
+        }
+    }
+    return true;
+}
+
+static bool XSCMaybeRepackRGBAToGray8(XSCMmapBuffer *buf, size_t width, size_t height) {
+    if (!buf || !buf->ptr ||
+        !XSCRGBAIsOpaqueGrayscale(buf->ptr, width, height, buf->bytesPerRow)) {
+        return false;
+    }
+    XSCMmapBuffer grayBuf;
+    if (!XSCMmapAlloc(width, height, 1u, &grayBuf)) {
+        return false;
+    }
+    const size_t srcBpr = buf->bytesPerRow;
+    const size_t dstBpr = grayBuf.bytesPerRow;
+    for (size_t y = 0u; y < height; y++) {
+        const uint8_t *src = buf->ptr + y * srcBpr;
+        uint8_t *dst = grayBuf.ptr + y * dstBpr;
+        for (size_t x = 0u; x < width; x++) {
+            dst[x] = src[x * 4u + 1u];
+        }
+    }
+    XSCMmapFree(buf);
+    *buf = grayBuf;
+    return true;
+}
+
+#pragma mark - XSCDecodedPage
+
+@implementation XSCDecodedPage {
+    uint8_t *_pixelBuffer;
+    size_t _allocSize;
+    size_t _frameByteSize;
+    size_t _pixelWidth;
+    size_t _pixelHeight;
+    size_t _bytesPerRow;
+    uint32_t _exifOrientation;
+    bool _isGrayscale;
+    size_t _byteCount;
+    bool _isAnimatedGIF;
+    size_t _gifFrameCount;
+    uint32_t *_gifFrameEndsMs;
+    uint32_t _gifPlayCount;
+    XSCData *_gifDataStorage;
+}
+
+- (const uint8_t *)pixels { return _pixelBuffer; }
+- (size_t)pixelWidth { return _pixelWidth; }
+- (size_t)pixelHeight { return _pixelHeight; }
+- (size_t)bytesPerRow { return _bytesPerRow; }
+- (uint32_t)exifOrientation { return _exifOrientation; }
+- (bool)isGrayscale { return _isGrayscale; }
+- (size_t)byteCount { return _byteCount; }
+- (bool)isAnimatedGIF { return _isAnimatedGIF; }
+- (size_t)gifFrameCount { return _gifFrameCount; }
+
+- (XSCOptData)gifData {
+    if (_gifDataStorage) {
+        return Some(XSCData *, _gifDataStorage);
+    }
+    return None(XSCData *);
+}
+
+- (instancetype)initWithMmapBuffer:(XSCMmapBuffer)buffer
+                        pixelWidth:(size_t)pixelWidth
+                       pixelHeight:(size_t)pixelHeight
+                   exifOrientation:(uint32_t)exifOrientation
+                       isGrayscale:(bool)isGrayscale
+                         byteCount:(size_t)byteCount
+                     isAnimatedGIF:(bool)isAnimatedGIF
+                     gifFrameCount:(size_t)gifFrameCount
+                  gifFrameEndsMs:(uint32_t *)gifFrameEndsMs
+                      gifPlayCount:(uint32_t)gifPlayCount
+                           gifData:(XSCData *)gifData {
+    self = [super init];
+    if (self) {
+        _pixelBuffer = buffer.ptr;
+        _allocSize = buffer.allocSize;
+        _bytesPerRow = buffer.bytesPerRow;
+        _pixelWidth = pixelWidth;
+        _pixelHeight = pixelHeight;
+        _frameByteSize = buffer.bytesPerRow * pixelHeight;
+        _exifOrientation = (exifOrientation >= 1u && exifOrientation <= 8u) ? exifOrientation : 1u;
+        _isGrayscale = isGrayscale;
+        _byteCount = byteCount;
+        _isAnimatedGIF = isAnimatedGIF;
+        _gifFrameCount = gifFrameCount;
+        _gifFrameEndsMs = gifFrameEndsMs;
+        _gifPlayCount = gifPlayCount;
+        _gifDataStorage = gifData;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_pixelBuffer && _allocSize > 0u) {
+        munmap(_pixelBuffer, _allocSize);
+        _pixelBuffer = NULL;
+        _allocSize = 0u;
+    }
+    free(_gifFrameEndsMs);
+    _gifFrameEndsMs = NULL;
+}
+
+- (XSCSizeF)orientedPixelSize {
+    if (_exifOrientation >= 5u && _exifOrientation <= 8u) {
+        return (XSCSizeF){ (float)_pixelHeight, (float)_pixelWidth };
+    }
+    return (XSCSizeF){ (float)_pixelWidth, (float)_pixelHeight };
+}
+
+- (const uint8_t *)gifFramePixelsAtIndex:(size_t)frameIndex outDelayMs:(uint32_t *)outDelayMs {
+    if (!_isAnimatedGIF || _gifFrameCount == 0u || !_pixelBuffer) {
+        if (outDelayMs) {
+            *outDelayMs = 100u;
+        }
+        return _pixelBuffer;
+    }
+    size_t idx = frameIndex % _gifFrameCount;
+    if (outDelayMs) {
+        *outDelayMs = _gifFrameEndsMs[idx] - (idx ? _gifFrameEndsMs[idx - 1u] : 0u);
+    }
+    return _pixelBuffer + idx * _frameByteSize;
+}
+
+- (size_t)gifFrameAtElapsedMs:(uint64_t)elapsed nextChangeMs:(uint64_t *)nextChange {
+    *nextChange = UINT64_MAX;
+    if (!_isAnimatedGIF) return 0u;
+
+    uint64_t duration = _gifFrameEndsMs[_gifFrameCount - 1u];
+    uint64_t cycle = elapsed / duration;
+    if (_gifPlayCount && cycle >= _gifPlayCount) return _gifFrameCount - 1u;
+
+    uint64_t phase = elapsed % duration;
+    size_t lo = 0u, hi = _gifFrameCount - 1u;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        if (phase < _gifFrameEndsMs[mid]) hi = mid;
+        else lo = mid + 1u;
+    }
+    if (!_gifPlayCount || cycle + 1u < _gifPlayCount || lo + 1u < _gifFrameCount) {
+        uint64_t remaining = _gifFrameEndsMs[lo] - phase;
+        if (remaining < UINT64_MAX - elapsed) *nextChange = elapsed + remaining;
+    }
+    return lo;
+}
+
+@end
+
+#pragma mark - EXIF Orientation & Format Detection
+
+static inline uint16_t XSCReadU16(const uint8_t *p, bool littleEndian) {
+    if (littleEndian) {
+        return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    }
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline uint32_t XSCReadU32(const uint8_t *p, bool littleEndian) {
+    if (littleEndian) {
+        return (uint32_t)p[0] |
+               ((uint32_t)p[1] << 8) |
+               ((uint32_t)p[2] << 16) |
+               ((uint32_t)p[3] << 24);
+    }
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+/*
+ Parses TIFF IFD0 orientation tag (0x0112) in either little-endian ("II") or
+ big-endian ("MM") byte order. Returns 1..8 (default 1).
+ */
+static uint32_t XSCParseTIFFOrientation(const uint8_t *tiff, size_t len) {
+    if (!tiff || len < 8u) return 1u;
+    bool le = false;
+    if (tiff[0] == 'I' && tiff[1] == 'I') {
+        le = true;
+    } else if (tiff[0] == 'M' && tiff[1] == 'M') {
+        le = false;
+    } else {
+        return 1u;
+    }
+    if (XSCReadU16(tiff + 2u, le) != 42u) {
+        return 1u;
+    }
+    uint32_t ifdOffset = XSCReadU32(tiff + 4u, le);
+    if (ifdOffset < 8u || (size_t)ifdOffset > len - 2u) {
+        return 1u;
+    }
+    uint16_t entryCount = XSCReadU16(tiff + ifdOffset, le);
+    size_t pos = (size_t)ifdOffset + 2u;
+    for (uint16_t i = 0u; i < entryCount; i++) {
+        if (len - pos < 12u) break;
+        uint16_t tag = XSCReadU16(tiff + pos, le);
+        if (tag == 0x0112u) {
+            uint16_t type = XSCReadU16(tiff + pos + 2u, le);
+            uint32_t count = XSCReadU32(tiff + pos + 4u, le);
+            if (count >= 1u) {
+                uint32_t val = 1u;
+                if (type == 3u) {
+                    // TIFF SHORT inline value occupies the first 2 bytes of the 4-byte value field.
+                    val = (uint32_t)XSCReadU16(tiff + pos + 8u, le);
+                } else if (type == 4u) {
+                    val = XSCReadU32(tiff + pos + 8u, le);
+                }
+                if (val >= 1u && val <= 8u) {
+                    return val;
+                }
+            }
+            return 1u;
+        }
+        pos += 12u;
+    }
+    return 1u;
+}
+
+static uint32_t XSCParseJPEGExifOrientation(const uint8_t *data, size_t len) {
+    if (!data || len < 4u || data[0] != 0xFFu || data[1] != 0xD8u) {
+        return 1u;
+    }
+    size_t pos = 2u;
+    while (pos < len) {
+        while (pos < len && data[pos] != 0xFFu) {
+            pos++;
+        }
+        while (pos < len && data[pos] == 0xFFu) {
+            pos++;
+        }
+        if (pos >= len) break;
+        uint8_t marker = data[pos++];
+        if (marker == 0xDAu || marker == 0xD9u) {
+            break; // Start of Scan or End of Image
+        }
+        if (marker == 0x00u || marker == 0x01u || (marker >= 0xD0u && marker <= 0xD8u)) {
+            continue; // Standalone markers have no length field
+        }
+        if (len - pos < 2u) break;
+        size_t segLen = ((size_t)data[pos] << 8) | (size_t)data[pos + 1u];
+        if (segLen < 2u || segLen > len - pos) break;
+        if (marker == 0xE1u && segLen >= 16u) {
+            const uint8_t *payload = data + pos + 2u;
+            size_t payloadLen = segLen - 2u;
+            if (memcmp(payload, "Exif\0\0", 6u) == 0) {
+                return XSCParseTIFFOrientation(payload + 6u, payloadLen - 6u);
+            }
+        }
+        pos += segLen;
+    }
+    return 1u;
+}
+
+typedef enum XSCImageFormat {
+    XSCImageFormatUnknown = 0,
+    XSCImageFormatJPEG,
+    XSCImageFormatPNG,
+    XSCImageFormatGIF,
+    XSCImageFormatWebP,
+    XSCImageFormatTIFF,
+    XSCImageFormatBMP,
+    XSCImageFormatAVIF,
+    XSCImageFormatHEIF,
+} XSCImageFormat;
+
+static bool XSCBrandMatches(const uint8_t *b, const char tag[4]) {
+    return memcmp(b, tag, 4u) == 0;
+}
+
+static XSCImageFormat XSCDetectImageFormat(const uint8_t *bytes, size_t len) {
+    if (!bytes || len < 2u) return XSCImageFormatUnknown;
+    if (len >= 2u && bytes[0] == 0xFFu && bytes[1] == 0xD8u) {
+        return XSCImageFormatJPEG;
+    }
+    if (len >= 8u && memcmp(bytes, "\x89PNG\r\n\x1a\n", 8u) == 0) {
+        return XSCImageFormatPNG;
+    }
+    if (len >= 6u && (memcmp(bytes, "GIF87a", 6u) == 0 || memcmp(bytes, "GIF89a", 6u) == 0)) {
+        return XSCImageFormatGIF;
+    }
+    if (len >= 12u && memcmp(bytes, "RIFF", 4u) == 0 && memcmp(bytes + 8u, "WEBP", 4u) == 0) {
+        return XSCImageFormatWebP;
+    }
+    if (len >= 4u &&
+        ((bytes[0] == 'I' && bytes[1] == 'I' && (bytes[2] == 42u || bytes[2] == 43u) && bytes[3] == 0u) ||
+         (bytes[0] == 'M' && bytes[1] == 'M' && bytes[2] == 0u && (bytes[3] == 42u || bytes[3] == 43u)))) {
+        return XSCImageFormatTIFF;
+    }
+    if (len >= 2u && bytes[0] == 'B' && bytes[1] == 'M') {
+        return XSCImageFormatBMP;
+    }
+    if (len >= 12u && memcmp(bytes + 4u, "ftyp", 4u) == 0) {
+        uint32_t boxSize = XSCReadU32(bytes, false);
+        size_t boxEnd = (boxSize >= 12u && (size_t)boxSize <= len) ? (size_t)boxSize : len;
+        bool sawAVIF = false;
+        bool sawHEIF = false;
+        // Check major brand (offset 8) and compatible brands (offset 16, 20, ...)
+        const uint8_t *major = bytes + 8u;
+        if (XSCBrandMatches(major, "avif") || XSCBrandMatches(major, "avis") ||
+            XSCBrandMatches(major, "MA1B") || XSCBrandMatches(major, "MA1A")) {
+            sawAVIF = true;
+        } else if (XSCBrandMatches(major, "heic") || XSCBrandMatches(major, "heix") ||
+                   XSCBrandMatches(major, "hevc") || XSCBrandMatches(major, "hevx") ||
+                   XSCBrandMatches(major, "heif") || XSCBrandMatches(major, "mif1") ||
+                   XSCBrandMatches(major, "msf1")) {
+            sawHEIF = true;
+        }
+        for (size_t off = 16u; off + 4u <= boxEnd; off += 4u) {
+            const uint8_t *cb = bytes + off;
+            if (XSCBrandMatches(cb, "avif") || XSCBrandMatches(cb, "avis")) {
+                sawAVIF = true;
+            } else if (XSCBrandMatches(cb, "heic") || XSCBrandMatches(cb, "heix") ||
+                       XSCBrandMatches(cb, "hevc") || XSCBrandMatches(cb, "hevx") ||
+                       XSCBrandMatches(cb, "heif")) {
+                sawHEIF = true;
+            }
+        }
+        if (sawAVIF) return XSCImageFormatAVIF;
+        if (sawHEIF) return XSCImageFormatHEIF;
+    }
+    return XSCImageFormatUnknown;
+}
+
+static XSCDecodedPage *XSCBuildStaticPage(XSCMmapBuffer *buf,
+                                          size_t width,
+                                          size_t height,
+                                          uint32_t orientation,
+                                          bool isGrayscale) {
+    if (!buf || !buf->ptr) return nil;
+    XSCMmapBuffer moved = *buf;
+    buf->ptr = NULL;
+    buf->allocSize = 0u;
+    buf->bytesPerRow = 0u;
+    buf->logicalSize = 0u;
+
+    XSCDecodedPage *page = [[XSCDecodedPage alloc] initWithMmapBuffer:moved
+                                                           pixelWidth:width
+                                                          pixelHeight:height
+                                                      exifOrientation:orientation
+                                                          isGrayscale:isGrayscale
+                                                            byteCount:moved.logicalSize
+                                                        isAnimatedGIF:false
+                                                        gifFrameCount:0u
+                                                     gifFrameEndsMs:NULL
+                                                         gifPlayCount:1u
+                                                              gifData:nil];
+    if (!page) {
+        XSCMmapFree(&moved);
+    }
+    return page;
+}
+
+#pragma mark - JPEG Decoder (libjpeg-turbo)
+
+typedef struct XSCJPEGErrorMgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf jb;
+    bool sawPrematureEOF;
+} XSCJPEGErrorMgr;
+
+static void XSCJPEGErrorExit(j_common_ptr cinfo) {
+    XSCJPEGErrorMgr *mgr = (XSCJPEGErrorMgr *)cinfo->err;
+    longjmp(mgr->jb, 1);
+}
+
+static void XSCJPEGEmitMessage(j_common_ptr cinfo, int msg_level) {
+    XSCJPEGErrorMgr *mgr = (XSCJPEGErrorMgr *)cinfo->err;
+    if (msg_level < 0) {
+        cinfo->err->num_warnings++;
+        if (cinfo->err->msg_code == JWRN_JPEG_EOF) {
+            mgr->sawPrematureEOF = true;
+        }
+    }
+}
+
+static void XSCJPEGOutputMessage(j_common_ptr cinfo) {
+    (void)cinfo;
+}
+
+typedef struct XSCJPEGDecodeState {
+    struct jpeg_decompress_struct cinfo;
+    XSCJPEGErrorMgr jerr;
+    bool created;
+    XSCMmapBuffer outBuf;
+    uint8_t *scratchRow;
+    size_t outW;
+    size_t outH;
+    bool isGrayscale;
+} XSCJPEGDecodeState;
+
+static bool XSCDecodeJPEGInner(XSCJPEGDecodeState *st, const uint8_t *bytes, size_t len) {
+    st->cinfo.err = jpeg_std_error(&st->jerr.pub);
+    st->jerr.pub.error_exit = XSCJPEGErrorExit;
+    st->jerr.pub.emit_message = XSCJPEGEmitMessage;
+    st->jerr.pub.output_message = XSCJPEGOutputMessage;
+    st->jerr.sawPrematureEOF = false;
+
+    if (setjmp(st->jerr.jb) != 0) {
+        return false;
+    }
+
+    jpeg_create_decompress(&st->cinfo);
+    st->created = true;
+    if (st->cinfo.mem) {
+        st->cinfo.mem->max_memory_to_use = 128L * 1024L * 1024L;
+    }
+    jpeg_mem_src(&st->cinfo, bytes, (unsigned long)len);
+
+    if (jpeg_read_header(&st->cinfo, TRUE) != JPEG_HEADER_OK) {
+        return false;
+    }
+    if (!XSCSourceDimensionsAllowed((size_t)st->cinfo.image_width, (size_t)st->cinfo.image_height)) {
+        return false;
+    }
+
+    // Use native libjpeg DCT scaling when source exceeds maximum texture dimension.
+    size_t maxSrc = (st->cinfo.image_width > st->cinfo.image_height)
+                        ? (size_t)st->cinfo.image_width
+                        : (size_t)st->cinfo.image_height;
+    if (maxSrc > kXSCMaxTextureDimension) {
+        unsigned int denom = 2u;
+        while (denom < 8u && (maxSrc + denom - 1u) / denom > kXSCMaxTextureDimension) {
+            denom *= 2u;
+        }
+        st->cinfo.scale_num = 1u;
+        st->cinfo.scale_denom = denom;
+    }
+
+    bool nativeGray = (st->cinfo.jpeg_color_space == JCS_GRAYSCALE || st->cinfo.num_components == 1);
+    bool isCMYK = (st->cinfo.jpeg_color_space == JCS_CMYK || st->cinfo.jpeg_color_space == JCS_YCCK);
+    bool useDirectRGBA = false;
+    if (nativeGray) {
+        st->cinfo.out_color_space = JCS_GRAYSCALE;
+    } else if (isCMYK) {
+        st->cinfo.out_color_space = JCS_CMYK;
+    } else {
+#ifdef JCS_EXT_RGBA
+        st->cinfo.out_color_space = JCS_EXT_RGBA;
+        useDirectRGBA = true;
+#else
+        st->cinfo.out_color_space = JCS_RGB;
+        useDirectRGBA = false;
+#endif
+    }
+
+    // Validate post-scaling dimensions & allocation ceiling before jpeg_start_decompress allocates buffers.
+    jpeg_calc_output_dimensions(&st->cinfo);
+    size_t estW = (size_t)st->cinfo.output_width;
+    size_t estH = (size_t)st->cinfo.output_height;
+    if (estW == 0u || estH == 0u) {
+        return false;
+    }
+    size_t estStride = XSCComputeDownsampleStride(estW, estH);
+    size_t estOutW = (estW + estStride - 1u) / estStride;
+    size_t estOutH = (estH + estStride - 1u) / estStride;
+    size_t estOutBpp = nativeGray ? 1u : 4u;
+    size_t estBpr = XSCAlign64(estOutW * estOutBpp);
+    if (estOutW > kXSCMaxTextureDimension || estOutH > kXSCMaxTextureDimension ||
+        estBpr > kXSCMaxDecodedAllocBytes / estOutH) {
+        return false;
+    }
+
+    if (!jpeg_start_decompress(&st->cinfo)) {
+        return false;
+    }
+
+    size_t decW = (size_t)st->cinfo.output_width;
+    size_t decH = (size_t)st->cinfo.output_height;
+    size_t comps = (size_t)st->cinfo.output_components;
+    if (decW == 0u || decH == 0u) {
+        return false;
+    }
+    if ((nativeGray && comps != 1u) ||
+        (isCMYK && comps != 4u) ||
+        (useDirectRGBA && comps != 4u) ||
+        (!nativeGray && !isCMYK && !useDirectRGBA && comps != 3u)) {
+        return false;
+    }
+
+    size_t stride = XSCComputeDownsampleStride(decW, decH);
+    size_t outW = (decW + stride - 1u) / stride;
+    size_t outH = (decH + stride - 1u) / stride;
+    size_t outBpp = nativeGray ? 1u : 4u;
+
+    if (!XSCMmapAlloc(outW, outH, outBpp, &st->outBuf)) {
+        return false;
+    }
+
+    if (stride == 1u && (nativeGray || useDirectRGBA)) {
+        while (st->cinfo.output_scanline < st->cinfo.output_height) {
+            size_t y = (size_t)st->cinfo.output_scanline;
+            JSAMPROW rowPtr = st->outBuf.ptr + y * st->outBuf.bytesPerRow;
+            if (jpeg_read_scanlines(&st->cinfo, &rowPtr, 1u) != 1u) {
+                return false;
+            }
+        }
+    } else {
+        st->scratchRow = (uint8_t *)malloc(decW * comps);
+        if (!st->scratchRow) {
+            return false;
+        }
+        size_t dstY = 0u;
+        while (st->cinfo.output_scanline < st->cinfo.output_height) {
+            size_t srcY = (size_t)st->cinfo.output_scanline;
+            JSAMPROW rowPtr = st->scratchRow;
+            if (jpeg_read_scanlines(&st->cinfo, &rowPtr, 1u) != 1u) {
+                return false;
+            }
+            if ((srcY % stride) != 0u || dstY >= outH) {
+                continue;
+            }
+            uint8_t *dst = st->outBuf.ptr + dstY * st->outBuf.bytesPerRow;
+            if (nativeGray) {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    dst[dx] = st->scratchRow[dx * stride];
+                }
+            } else if (isCMYK) {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    const uint8_t *sp = st->scratchRow + (dx * stride) * 4u;
+                    uint8_t *dp = dst + dx * 4u;
+                    unsigned k = (unsigned)sp[3];
+                    dp[0] = (uint8_t)(((unsigned)sp[0] * k) / 255u);
+                    dp[1] = (uint8_t)(((unsigned)sp[1] * k) / 255u);
+                    dp[2] = (uint8_t)(((unsigned)sp[2] * k) / 255u);
+                    dp[3] = 255u;
+                }
+            } else if (useDirectRGBA) {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    const uint8_t *sp = st->scratchRow + (dx * stride) * 4u;
+                    uint8_t *dp = dst + dx * 4u;
+                    dp[0] = sp[0];
+                    dp[1] = sp[1];
+                    dp[2] = sp[2];
+                    dp[3] = sp[3];
+                }
+            } else {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    const uint8_t *sp = st->scratchRow + (dx * stride) * 3u;
+                    uint8_t *dp = dst + dx * 4u;
+                    dp[0] = sp[0];
+                    dp[1] = sp[1];
+                    dp[2] = sp[2];
+                    dp[3] = 255u;
+                }
+            }
+            dstY++;
+        }
+    }
+
+    jpeg_finish_decompress(&st->cinfo);
+    if (st->jerr.sawPrematureEOF) {
+        return false;
+    }
+    st->outW = outW;
+    st->outH = outH;
+    st->isGrayscale = nativeGray;
+    return true;
+}
+
+static XSCDecodedPage *XSCDecodeJPEG(const uint8_t *bytes, size_t len) {
+    uint32_t orientation = XSCParseJPEGExifOrientation(bytes, len);
+    XSCJPEGDecodeState st;
+    memset(&st, 0, sizeof(st));
+    defer {
+        free(st.scratchRow);
+        if (st.created) {
+            jpeg_destroy_decompress(&st.cinfo);
+        }
+        XSCMmapFree(&st.outBuf);
+    }
+
+    if (!XSCDecodeJPEGInner(&st, bytes, len)) {
+        return nil;
+    }
+
+    bool finalGray = st.isGrayscale;
+    if (!finalGray) {
+        finalGray = XSCMaybeRepackRGBAToGray8(&st.outBuf, st.outW, st.outH);
+    }
+    return XSCBuildStaticPage(&st.outBuf, st.outW, st.outH, orientation, finalGray);
+}
+
+#pragma mark - PNG Decoder (libpng)
+
+typedef struct XSCPNGMemReader {
+    const uint8_t *data;
+    size_t size;
+    size_t offset;
+} XSCPNGMemReader;
+
+static void XSCPNGReadFn(png_structp pngPtr, png_bytep outBytes, png_size_t byteCount) {
+    XSCPNGMemReader *r = (XSCPNGMemReader *)png_get_io_ptr(pngPtr);
+    if (!r || byteCount > r->size - r->offset) {
+        png_error(pngPtr, "Truncated PNG stream");
+        return;
+    }
+    memcpy(outBytes, r->data + r->offset, byteCount);
+    r->offset += byteCount;
+}
+
+static void XSCPNGErrorFn(png_structp pngPtr, png_const_charp msg) {
+    (void)msg;
+    png_longjmp(pngPtr, 1);
+}
+
+static void XSCPNGWarningFn(png_structp pngPtr, png_const_charp msg) {
+    (void)pngPtr;
+    (void)msg;
+}
+
+typedef struct XSCPNGDecodeState {
+    png_structp png;
+    png_infop info;
+    XSCPNGMemReader reader;
+    XSCMmapBuffer outBuf;
+    uint8_t *scratchRow;
+    size_t outW;
+    size_t outH;
+    uint32_t orientation;
+    bool isGrayscale;
+} XSCPNGDecodeState;
+
+static bool XSCDecodePNGInner(XSCPNGDecodeState *st, const uint8_t *bytes, size_t len) {
+    st->png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, XSCPNGErrorFn, XSCPNGWarningFn);
+    if (!st->png) return false;
+    st->info = png_create_info_struct(st->png);
+    if (!st->info) return false;
+
+    if (setjmp(png_jmpbuf(st->png)) != 0) {
+        return false;
+    }
+
+    st->reader.data = bytes;
+    st->reader.size = len;
+    st->reader.offset = 0u;
+    png_set_read_fn(st->png, &st->reader, XSCPNGReadFn);
+#ifdef PNG_USER_LIMITS_SUPPORTED
+    png_set_user_limits(st->png, (png_uint_32)kXSCMaxSourceDimension, (png_uint_32)kXSCMaxSourceDimension);
+    png_set_chunk_malloc_max(st->png, 8u * 1024u * 1024u);
+#endif
+    png_read_info(st->png, st->info);
+
+    png_uint_32 w32 = 0u, h32 = 0u;
+    int bitDepth = 0, colorType = 0, interlaceType = 0;
+    png_get_IHDR(st->png, st->info, &w32, &h32, &bitDepth, &colorType, &interlaceType, NULL, NULL);
+    if (!XSCSourceDimensionsAllowed((size_t)w32, (size_t)h32)) {
+        return false;
+    }
+
+    st->orientation = 1u;
+#ifdef PNG_eXIf_SUPPORTED
+    png_uint_32 exifLen = 0u;
+    png_bytep exifBuf = NULL;
+    if (png_get_eXIf_1(st->png, st->info, &exifLen, &exifBuf) == PNG_INFO_eXIf && exifBuf && exifLen >= 8u) {
+        st->orientation = XSCParseTIFFOrientation(exifBuf, (size_t)exifLen);
+    }
+#endif
+
+    bool hasTRNS = (png_get_valid(st->png, st->info, PNG_INFO_tRNS) != 0u);
+    bool nativeGray = (colorType == PNG_COLOR_TYPE_GRAY && !hasTRNS);
+
+    if (nativeGray) {
+        if (bitDepth == 16) png_set_strip_16(st->png);
+        if (bitDepth < 8) png_set_expand_gray_1_2_4_to_8(st->png);
+    } else {
+        if (bitDepth == 16) png_set_strip_16(st->png);
+        if (colorType == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(st->png);
+        if (colorType == PNG_COLOR_TYPE_GRAY && bitDepth < 8) png_set_expand_gray_1_2_4_to_8(st->png);
+        if (hasTRNS) png_set_tRNS_to_alpha(st->png);
+        if (colorType == PNG_COLOR_TYPE_GRAY || colorType == PNG_COLOR_TYPE_GRAY_ALPHA) {
+            png_set_gray_to_rgb(st->png);
+        }
+        if ((colorType & PNG_COLOR_MASK_ALPHA) == 0 && !hasTRNS) {
+            png_set_filler(st->png, 0xFFu, PNG_FILLER_AFTER);
+        }
+    }
+
+    int numPasses = png_set_interlace_handling(st->png);
+    png_read_update_info(st->png, st->info);
+
+    size_t srcW = (size_t)w32;
+    size_t srcH = (size_t)h32;
+    size_t bpp = nativeGray ? 1u : 4u;
+    size_t rowBytes = png_get_rowbytes(st->png, st->info);
+    if (rowBytes != srcW * bpp) {
+        return false;
+    }
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    if (stride > 1u && numPasses > 1) {
+        // Interlaced images > 16384 px require full-frame pass accumulation; reject safely.
+        return false;
+    }
+
+    if (!XSCMmapAlloc(outW, outH, bpp, &st->outBuf)) {
+        return false;
+    }
+
+    if (stride == 1u) {
+        for (int p = 0; p < numPasses; p++) {
+            for (size_t y = 0u; y < srcH; y++) {
+                png_read_row(st->png, st->outBuf.ptr + y * st->outBuf.bytesPerRow, NULL);
+            }
+        }
+    } else {
+        st->scratchRow = (uint8_t *)malloc(rowBytes);
+        if (!st->scratchRow) return false;
+        size_t dstY = 0u;
+        for (size_t y = 0u; y < srcH; y++) {
+            png_read_row(st->png, st->scratchRow, NULL);
+            if ((y % stride) != 0u || dstY >= outH) continue;
+            uint8_t *dst = st->outBuf.ptr + dstY * st->outBuf.bytesPerRow;
+            if (nativeGray) {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    dst[dx] = st->scratchRow[dx * stride];
+                }
+            } else {
+                for (size_t dx = 0u; dx < outW; dx++) {
+                    const uint8_t *sp = st->scratchRow + (dx * stride) * 4u;
+                    uint8_t *dp = dst + dx * 4u;
+                    dp[0] = sp[0];
+                    dp[1] = sp[1];
+                    dp[2] = sp[2];
+                    dp[3] = sp[3];
+                }
+            }
+            dstY++;
+        }
+    }
+
+    png_read_end(st->png, NULL);
+    st->outW = outW;
+    st->outH = outH;
+    st->isGrayscale = nativeGray;
+    return true;
+}
+
+static XSCDecodedPage *XSCDecodePNG(const uint8_t *bytes, size_t len) {
+    XSCPNGDecodeState st;
+    memset(&st, 0, sizeof(st));
+    defer {
+        free(st.scratchRow);
+        if (st.png) {
+            png_destroy_read_struct(&st.png, st.info ? &st.info : NULL, NULL);
+        }
+        XSCMmapFree(&st.outBuf);
+    }
+
+    if (!XSCDecodePNGInner(&st, bytes, len)) {
+        return nil;
+    }
+
+    bool finalGray = st.isGrayscale;
+    if (!finalGray) {
+        finalGray = XSCMaybeRepackRGBAToGray8(&st.outBuf, st.outW, st.outH);
+    }
+    return XSCBuildStaticPage(&st.outBuf, st.outW, st.outH, st.orientation, finalGray);
+}
+
+#pragma mark - GIF Decoder (giflib, static & multi-frame composited)
+
+typedef struct XSCGIFMemReader {
+    const uint8_t *data;
+    size_t size;
+    size_t offset;
+} XSCGIFMemReader;
+
+static int XSCGIFReadFn(GifFileType *gif, GifByteType *outBuf, int len) {
+    XSCGIFMemReader *r = (XSCGIFMemReader *)gif->UserData;
+    if (!r || len <= 0 || r->offset >= r->size) return 0;
+    size_t avail = r->size - r->offset;
+    size_t n = ((size_t)len < avail) ? (size_t)len : avail;
+    memcpy(outBuf, r->data + r->offset, n);
+    r->offset += n;
+    return (int)n;
+}
+
+static bool XSCGIFSkipSubBlocks(const uint8_t *bytes, size_t len, size_t *pos) {
+    while (*pos < len) {
+        uint8_t subLen = bytes[(*pos)++];
+        if (subLen == 0u) return true;
+        if (subLen > len - *pos) return false;
+        *pos += subLen;
+    }
+    return false;
+}
+
+/*
+ Pre-validates GIF screen & frame dimensions and frame count BEFORE calling
+ DGifSlurp so hostile 65535x65535 or 100k-frame GIF headers cannot force huge
+ upfront raster allocations inside giflib.
+ */
+static bool XSCGIFValidateHeaders(const uint8_t *bytes, size_t len) {
+    if (!bytes || len < 14u) return false;
+    if (memcmp(bytes, "GIF87a", 6u) != 0 && memcmp(bytes, "GIF89a", 6u) != 0) {
+        return false;
+    }
+    size_t sw = (size_t)XSCReadU16(bytes + 6u, true);
+    size_t sh = (size_t)XSCReadU16(bytes + 8u, true);
+    if (sw == 0u || sh == 0u || sw > kXSCMaxTextureDimension || sh > kXSCMaxTextureDimension) {
+        return false;
+    }
+    size_t bpr = XSCAlign64(sw * 4u);
+    if (bpr > kXSCMaxDecodedAllocBytes / sh) {
+        return false;
+    }
+    size_t frameBytes = bpr * sh;
+    size_t pos = 13u;
+    uint8_t packed = bytes[10u];
+    if ((packed & 0x80u) != 0u) {
+        size_t gctBytes = 3u * ((size_t)1u << ((packed & 0x07u) + 1u));
+        if (gctBytes > len - pos) return false;
+        pos += gctBytes;
+    }
+
+    size_t frameCount = 0u;
+    while (pos < len) {
+        uint8_t intro = bytes[pos++];
+        if (intro == 0x3Bu) {
+            break;
+        } else if (intro == 0x21u) {
+            if (pos >= len) return false;
+            pos++; // extension label
+            if (!XSCGIFSkipSubBlocks(bytes, len, &pos)) return false;
+        } else if (intro == 0x2Cu) {
+            if (len - pos < 9u) return false;
+            size_t fw = (size_t)XSCReadU16(bytes + pos + 4u, true);
+            size_t fh = (size_t)XSCReadU16(bytes + pos + 6u, true);
+            uint8_t ipacked = bytes[pos + 8u];
+            pos += 9u;
+            if (fw == 0u || fh == 0u || fw > kXSCMaxTextureDimension || fh > kXSCMaxTextureDimension) {
+                return false;
+            }
+            if (fw > (kXSCMaxDecodedAllocBytes / 4u) / fh) {
+                return false;
+            }
+            frameCount++;
+            if (frameCount > kXSCMaxGIFFrames || frameCount > kXSCMaxDecodedAllocBytes / frameBytes) {
+                return false;
+            }
+            if ((ipacked & 0x80u) != 0u) {
+                size_t lctBytes = 3u * ((size_t)1u << ((ipacked & 0x07u) + 1u));
+                if (lctBytes > len - pos) return false;
+                pos += lctBytes;
+            }
+            if (pos >= len) return false;
+            uint8_t minCodeSize = bytes[pos++];
+            if (minCodeSize == 0u || minCodeSize > 12u) return false;
+            if (!XSCGIFSkipSubBlocks(bytes, len, &pos)) return false;
+        } else if (intro == 0x00u) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return frameCount > 0u;
+}
+
+static bool XSCGIFGetPlayCount(const ExtensionBlock *blocks, int count, uint32_t *playCount) {
+    for (int i = 0; i + 1 < count; i++) {
+        const ExtensionBlock *app = &blocks[i];
+        const ExtensionBlock *data = &blocks[i + 1];
+        if (app->Function == APPLICATION_EXT_FUNC_CODE && app->ByteCount == 11 &&
+            (memcmp(app->Bytes, "NETSCAPE2.0", 11u) == 0 ||
+             memcmp(app->Bytes, "ANIMEXTS1.0", 11u) == 0) &&
+            data->Function == CONTINUE_EXT_FUNC_CODE && data->ByteCount == 3 && data->Bytes[0] == 1u) {
+            uint16_t repeats = XSCReadU16(data->Bytes + 1u, true);
+            *playCount = repeats ? (uint32_t)repeats + 1u : 0u;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void XSCGIFFill(uint8_t *pixels, size_t count, const uint8_t color[4]) {
+    if (color[3] == 0u) {
+        memset(pixels, 0, count * 4u);
+        return;
+    }
+    for (size_t x = 0u; x < count; x++) memcpy(pixels + x * 4u, color, 4u);
+}
+
+static XSCDecodedPage *XSCDecodeGIF(XSCData *rawData) {
+    const uint8_t *bytes = rawData.bytes;
+    size_t len = rawData.length;
+    if (!XSCGIFValidateHeaders(bytes, len)) {
+        return nil;
+    }
+
+    XSCGIFMemReader reader = { bytes, len, 0u };
+    int errCode = 0;
+    GifFileType *gif = DGifOpen(&reader, XSCGIFReadFn, &errCode);
+    if (!gif) return nil;
+    defer {
+        int closeErr = 0;
+        DGifCloseFile(gif, &closeErr);
+    }
+
+    if (DGifSlurp(gif) != GIF_OK) {
+        return nil;
+    }
+    if (gif->ImageCount <= 0 || gif->SWidth <= 0 || gif->SHeight <= 0) {
+        return nil;
+    }
+
+    size_t canvasW = (size_t)gif->SWidth;
+    size_t canvasH = (size_t)gif->SHeight;
+    if (canvasW > kXSCMaxTextureDimension || canvasH > kXSCMaxTextureDimension) {
+        return nil;
+    }
+    if (canvasW > SIZE_MAX / canvasH || (canvasW * canvasH) > (kXSCMaxDecodedAllocBytes / 4u)) {
+        return nil;
+    }
+
+    size_t frameCount = (size_t)gif->ImageCount;
+    bool isAnimated = (frameCount > 1u);
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAllocFrames(canvasW, canvasH, 4u, frameCount, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    size_t canvasBytes = canvasW * canvasH * 4u;
+    uint8_t *canvas = (uint8_t *)calloc(1u, canvasBytes);
+    if (!canvas) return nil;
+    defer { free(canvas); }
+
+    uint8_t *prevCanvas = NULL;
+    defer { free(prevCanvas); }
+
+    uint32_t *frameEnds = NULL;
+    if (isAnimated) {
+        frameEnds = (uint32_t *)malloc(frameCount * sizeof(*frameEnds));
+        if (!frameEnds) return nil;
+    }
+    defer { free(frameEnds); }
+    uint32_t duration = 0u;
+    uint32_t playCount = 1u;
+    bool hasPlayCount = false;
+    uint8_t background[4] = {0};
+    if (gif->SColorMap && gif->SBackGroundColor < gif->SColorMap->ColorCount) {
+        GifColorType color = gif->SColorMap->Colors[gif->SBackGroundColor];
+        memcpy(background, (uint8_t[]){color.Red, color.Green, color.Blue, 255u}, 4u);
+    }
+    const uint8_t transparent[4] = {0};
+    bool hasAnyTransparency = false;
+    for (size_t f = 0u; f < frameCount; f++) {
+        GraphicsControlBlock probe;
+        probe.DisposalMode = DISPOSAL_UNSPECIFIED;
+        probe.UserInputFlag = false;
+        probe.DelayTime = 0;
+        probe.TransparentColor = NO_TRANSPARENT_COLOR;
+        if (DGifSavedExtensionToGCB(gif, (int)f, &probe) == GIF_OK &&
+            probe.TransparentColor != NO_TRANSPARENT_COLOR) {
+            hasAnyTransparency = true;
+            break;
+        }
+    }
+    const uint8_t *clearColor = hasAnyTransparency ? transparent : background;
+    XSCGIFFill(canvas, canvasW * canvasH, clearColor);
+    size_t frameBytes = outBuf.bytesPerRow * canvasH;
+
+    for (size_t f = 0u; f < frameCount; f++) {
+        const SavedImage *img = &gif->SavedImages[f];
+        const GifImageDesc *desc = &img->ImageDesc;
+
+        GraphicsControlBlock gcb;
+        gcb.DisposalMode = DISPOSAL_UNSPECIFIED;
+        gcb.UserInputFlag = false;
+        gcb.DelayTime = 0;
+        gcb.TransparentColor = NO_TRANSPARENT_COLOR;
+        (void)DGifSavedExtensionToGCB(gif, (int)f, &gcb);
+
+        uint32_t delayMs = (gcb.DelayTime > 0) ? ((uint32_t)gcb.DelayTime * 10u) : 0u;
+        if (delayMs < 20u) {
+            delayMs = 100u;
+        }
+        if (frameEnds) {
+            duration += delayMs;
+            frameEnds[f] = duration;
+        }
+        if (!hasPlayCount) {
+            hasPlayCount = XSCGIFGetPlayCount(img->ExtensionBlocks, img->ExtensionBlockCount, &playCount);
+        }
+
+        if (gcb.DisposalMode == DISPOSE_PREVIOUS) {
+            if (!prevCanvas) {
+                prevCanvas = (uint8_t *)malloc(canvasBytes);
+                if (!prevCanvas) return nil;
+            }
+            memcpy(prevCanvas, canvas, canvasBytes);
+        }
+
+        const ColorMapObject *cmap = desc->ColorMap ? desc->ColorMap : gif->SColorMap;
+        int left = desc->Left;
+        int top = desc->Top;
+        int fw = desc->Width;
+        int fh = desc->Height;
+
+        size_t width = 0u, height = 0u;
+        if (left >= 0 && top >= 0 && left < (int)canvasW && top < (int)canvasH) {
+            int availableWidth = (int)canvasW - left;
+            int availableHeight = (int)canvasH - top;
+            width = (size_t)(fw < availableWidth ? fw : availableWidth);
+            height = (size_t)(fh < availableHeight ? fh : availableHeight);
+        }
+        if (img->RasterBits && cmap && cmap->Colors && width && height) {
+            uint8_t palette[256][4];
+            for (int i = 0; i < cmap->ColorCount; i++) {
+                GifColorType color = cmap->Colors[i];
+                memcpy(palette[i], (uint8_t[]){color.Red, color.Green, color.Blue, 255u}, 4u);
+            }
+            // DGifSlurp already places interlaced rows in display order.
+            for (size_t y = 0u; y < height; y++) {
+                const GifByteType *src = img->RasterBits + y * (size_t)fw;
+                uint8_t *dst = canvas + ((y + (size_t)top) * canvasW + (size_t)left) * 4u;
+                for (size_t x = 0u; x < width; x++) {
+                    int index = src[x];
+                    if (index != gcb.TransparentColor && index < cmap->ColorCount) {
+                        memcpy(dst + x * 4u, palette[index], 4u);
+                    }
+                }
+            }
+        }
+
+        // Snapshot composited canvas into 64-byte row-aligned frame slot.
+        uint8_t *frameDst = outBuf.ptr + f * frameBytes;
+        for (size_t y = 0u; y < canvasH; y++) {
+            memcpy(frameDst + y * outBuf.bytesPerRow, canvas + y * canvasW * 4u, canvasW * 4u);
+        }
+
+        // Apply disposal mode for subsequent frame.
+        if (f + 1u < frameCount) {
+            if (gcb.DisposalMode == DISPOSE_BACKGROUND) {
+                if (width) {
+                    for (size_t y = 0u; y < height; y++) {
+                        uint8_t *row = canvas + ((y + (size_t)top) * canvasW + (size_t)left) * 4u;
+                        XSCGIFFill(row, width, clearColor);
+                    }
+                }
+            } else if (gcb.DisposalMode == DISPOSE_PREVIOUS && prevCanvas) {
+                memcpy(canvas, prevCanvas, canvasBytes);
+            }
+        }
+    }
+
+    if (!isAnimated) {
+        // Single-frame GIF behaves like a normal static page (eligible for Gray8 repack).
+        bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, canvasW, canvasH);
+        return XSCBuildStaticPage(&outBuf, canvasW, canvasH, 1u, isGray);
+    }
+
+    // Animated GIF stays RGBA8 across all frames for uniform GL_RGBA8 frame uploads.
+    XSCMmapBuffer movedBuf = outBuf;
+    outBuf.ptr = NULL;
+    outBuf.allocSize = 0u;
+    if (!hasPlayCount) XSCGIFGetPlayCount(gif->ExtensionBlocks, gif->ExtensionBlockCount, &playCount);
+    uint32_t *movedEnds = frameEnds;
+    frameEnds = NULL;
+
+    size_t accountedBytes = movedBuf.logicalSize + rawData.length;
+    XSCDecodedPage *page = [[XSCDecodedPage alloc] initWithMmapBuffer:movedBuf
+                                                           pixelWidth:canvasW
+                                                          pixelHeight:canvasH
+                                                      exifOrientation:1u
+                                                          isGrayscale:false
+                                                            byteCount:accountedBytes
+                                                        isAnimatedGIF:true
+                                                        gifFrameCount:frameCount
+                                                     gifFrameEndsMs:movedEnds
+                                                         gifPlayCount:playCount
+                                                              gifData:rawData];
+    if (!page) {
+        XSCMmapFree(&movedBuf);
+        free(movedEnds);
+    }
+    return page;
+}
+
+#pragma mark - WebP Decoder (libwebp)
+
+static XSCDecodedPage *XSCDecodeWebP(const uint8_t *bytes, size_t len) {
+    WebPBitstreamFeatures features;
+    if (WebPGetFeatures(bytes, len, &features) != VP8_STATUS_OK) {
+        return nil;
+    }
+    if (features.width <= 0 || features.height <= 0 ||
+        !XSCSourceDimensionsAllowed((size_t)features.width, (size_t)features.height)) {
+        return nil;
+    }
+
+    size_t srcW = (size_t)features.width;
+    size_t srcH = (size_t)features.height;
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAlloc(outW, outH, 4u, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    if (stride == 1u) {
+        if (!WebPDecodeRGBAInto(bytes, len, outBuf.ptr, outBuf.logicalSize, (int)outBuf.bytesPerRow)) {
+            return nil;
+        }
+    } else {
+        WebPDecoderConfig config;
+        if (!WebPInitDecoderConfig(&config)) {
+            return nil;
+        }
+        config.options.use_scaling = 1;
+        config.options.scaled_width = (int)outW;
+        config.options.scaled_height = (int)outH;
+        config.output.colorspace = MODE_RGBA;
+        config.output.is_external_memory = 1;
+        config.output.u.RGBA.rgba = outBuf.ptr;
+        config.output.u.RGBA.stride = (int)outBuf.bytesPerRow;
+        config.output.u.RGBA.size = outBuf.logicalSize;
+        VP8StatusCode status = WebPDecode(bytes, len, &config);
+        WebPFreeDecBuffer(&config.output);
+        if (status != VP8_STATUS_OK) {
+            return nil;
+        }
+    }
+
+    bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, outW, outH);
+    return XSCBuildStaticPage(&outBuf, outW, outH, 1u, isGray);
+}
+
+#pragma mark - TIFF Decoder (libtiff in-memory stream)
+
+static pthread_once_t gTIFFSilenceOnce = PTHREAD_ONCE_INIT;
+
+static void XSCSilenceTIFFHandlers(void) {
+    TIFFSetErrorHandler(NULL);
+    TIFFSetWarningHandler(NULL);
+}
+
+typedef struct XSCTIFFMemStream {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+} XSCTIFFMemStream;
+
+static tmsize_t XSCTIFFReadProc(thandle_t handle, void *buf, tmsize_t count) {
+    XSCTIFFMemStream *s = (XSCTIFFMemStream *)handle;
+    if (!s || count < 0) return -1;
+    if (s->pos >= s->size) return 0;
+    size_t avail = s->size - s->pos;
+    size_t n = ((size_t)count < avail) ? (size_t)count : avail;
+    memcpy(buf, s->data + s->pos, n);
+    s->pos += n;
+    return (tmsize_t)n;
+}
+
+static tmsize_t XSCTIFFWriteProc(thandle_t handle, void *buf, tmsize_t count) {
+    (void)handle;
+    (void)buf;
+    (void)count;
+    return -1;
+}
+
+static toff_t XSCTIFFSeekProc(thandle_t handle, toff_t offset, int whence) {
+    XSCTIFFMemStream *s = (XSCTIFFMemStream *)handle;
+    if (!s) return (toff_t)-1;
+    uint64_t nextPos = 0u;
+    switch (whence) {
+    case SEEK_SET:
+        if ((uint64_t)offset > (uint64_t)s->size) return (toff_t)-1;
+        nextPos = (uint64_t)offset;
+        break;
+    case SEEK_CUR: {
+        if (s->pos > (size_t)INT64_MAX) return (toff_t)-1;
+        int64_t signedPos = 0;
+        if (__builtin_add_overflow((int64_t)s->pos, (int64_t)offset, &signedPos) ||
+            signedPos < 0 || (uint64_t)signedPos > (uint64_t)s->size) {
+            return (toff_t)-1;
+        }
+        nextPos = (uint64_t)signedPos;
+        break;
+    }
+    case SEEK_END: {
+        if (s->size > (size_t)INT64_MAX) return (toff_t)-1;
+        int64_t signedPos = 0;
+        if (__builtin_add_overflow((int64_t)s->size, (int64_t)offset, &signedPos) ||
+            signedPos < 0 || (uint64_t)signedPos > (uint64_t)s->size) {
+            return (toff_t)-1;
+        }
+        nextPos = (uint64_t)signedPos;
+        break;
+    }
+    default:
+        return (toff_t)-1;
+    }
+    s->pos = (size_t)nextPos;
+    return (toff_t)s->pos;
+}
+
+static int XSCTIFFCloseProc(thandle_t handle) {
+    (void)handle;
+    return 0;
+}
+
+static toff_t XSCTIFFSizeProc(thandle_t handle) {
+    XSCTIFFMemStream *s = (XSCTIFFMemStream *)handle;
+    return s ? (toff_t)s->size : 0u;
+}
+
+static int XSCTIFFMapProc(thandle_t handle, void **base, toff_t *size) {
+    (void)handle;
+    (void)base;
+    (void)size;
+    return 0;
+}
+
+static void XSCTIFFUnmapProc(thandle_t handle, void *base, toff_t size) {
+    (void)handle;
+    (void)base;
+    (void)size;
+}
+
+static XSCDecodedPage *XSCDecodeTIFF(const uint8_t *bytes, size_t len) {
+    pthread_once(&gTIFFSilenceOnce, XSCSilenceTIFFHandlers);
+
+    XSCTIFFMemStream stream = { bytes, len, 0u };
+    TIFF *tif = TIFFClientOpen("mem.tiff",
+                               "rm",
+                               (thandle_t)&stream,
+                               XSCTIFFReadProc,
+                               XSCTIFFWriteProc,
+                               XSCTIFFSeekProc,
+                               XSCTIFFCloseProc,
+                               XSCTIFFSizeProc,
+                               XSCTIFFMapProc,
+                               XSCTIFFUnmapProc);
+    if (!tif) return nil;
+    defer { TIFFClose(tif); }
+
+    uint32_t w32 = 0u, h32 = 0u;
+    if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w32) ||
+        !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h32) ||
+        w32 == 0u || h32 == 0u) {
+        return nil;
+    }
+    size_t srcW = (size_t)w32;
+    size_t srcH = (size_t)h32;
+    if (!XSCSourceDimensionsAllowed(srcW, srcH)) {
+        return nil;
+    }
+    if (srcW > (kXSCMaxDecodedAllocBytes / sizeof(uint32_t)) / srcH) {
+        return nil;
+    }
+
+    uint16_t rawOrient = ORIENTATION_TOPLEFT;
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ORIENTATION, &rawOrient);
+    uint32_t exifOrient = (rawOrient >= 1u && rawOrient <= 8u) ? (uint32_t)rawOrient : 1u;
+
+    // Match both flip directions in libtiff. Apply the full orientation in GL.
+    int reqOrient = (int)(exifOrient <= 4u ? exifOrient : exifOrient - 4u);
+
+    uint32_t *raster = (uint32_t *)malloc(srcW * srcH * sizeof(uint32_t));
+    if (!raster) return nil;
+    defer { free(raster); }
+
+    if (!TIFFReadRGBAImageOriented(tif, w32, h32, raster, reqOrient, 0)) {
+        return nil;
+    }
+
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAlloc(outW, outH, 4u, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    for (size_t dy = 0u; dy < outH; dy++) {
+        size_t sy = dy * stride;
+        const uint32_t *srow = raster + sy * srcW;
+        uint8_t *drow = outBuf.ptr + dy * outBuf.bytesPerRow;
+        for (size_t dx = 0u; dx < outW; dx++) {
+            uint32_t px = srow[dx * stride];
+            uint8_t *dp = drow + dx * 4u;
+            dp[0] = (uint8_t)TIFFGetR(px);
+            dp[1] = (uint8_t)TIFFGetG(px);
+            dp[2] = (uint8_t)TIFFGetB(px);
+            unsigned int alpha = TIFFGetA(px);
+            dp[3] = (uint8_t)alpha;
+            // libtiff returns associated alpha. The canvas blends straight RGBA.
+            if (alpha > 0u && alpha < 255u) {
+                for (size_t channel = 0u; channel < 3u; channel++) {
+                    unsigned int straight = (dp[channel] * 255u + alpha / 2u) / alpha;
+                    dp[channel] = (uint8_t)(straight > 255u ? 255u : straight);
+                }
+            }
+        }
+    }
+
+    bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, outW, outH);
+    return XSCBuildStaticPage(&outBuf, outW, outH, exifOrient, isGray);
+}
+
+#pragma mark - Built-in Zero-Dep BMP Decoder (24-bit & 32-bit BI_RGB)
+
+static XSCDecodedPage *XSCDecodeBMP(const uint8_t *bytes, size_t len) {
+    if (!bytes || len < 54u || bytes[0] != 'B' || bytes[1] != 'M') {
+        return nil;
+    }
+    uint32_t pixelOffset = XSCReadU32(bytes + 10u, true);
+    uint32_t dibSize = XSCReadU32(bytes + 14u, true);
+    if (dibSize < 40u || (size_t)dibSize > len - 14u) {
+        return nil;
+    }
+
+    int32_t rawW = (int32_t)XSCReadU32(bytes + 18u, true);
+    int32_t rawH = (int32_t)XSCReadU32(bytes + 22u, true);
+    uint16_t planes = XSCReadU16(bytes + 26u, true);
+    uint16_t bpp = XSCReadU16(bytes + 28u, true);
+    uint32_t compression = XSCReadU32(bytes + 30u, true);
+
+    if (planes != 1u || compression != 0u || (bpp != 24u && bpp != 32u)) {
+        return nil;
+    }
+    if (rawW <= 0 || rawH == 0 || rawH == INT32_MIN) {
+        return nil;
+    }
+
+    bool topDown = (rawH < 0);
+    size_t srcW = (size_t)rawW;
+    size_t srcH = (size_t)(topDown ? -(int64_t)rawH : (int64_t)rawH);
+    if (!XSCSourceDimensionsAllowed(srcW, srcH)) {
+        return nil;
+    }
+
+    size_t srcBpp = (size_t)(bpp / 8u);
+    if (srcW > (SIZE_MAX - 3u) / srcBpp) return nil;
+    size_t srcRowBytes = ((srcW * srcBpp) + 3u) & ~(size_t)3u;
+    if ((size_t)pixelOffset < 14u + (size_t)dibSize ||
+        (size_t)pixelOffset > len ||
+        srcRowBytes > (len - (size_t)pixelOffset) / srcH) {
+        return nil;
+    }
+
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAlloc(outW, outH, 4u, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    const uint8_t *pixelBase = bytes + pixelOffset;
+    bool hasAnyAlpha32 = false;
+    if (bpp == 32u) {
+        // Distinguish BGRX (all-zero pad byte) from genuine BGRA32.
+        for (size_t dy = 0u; dy < outH && !hasAnyAlpha32; dy++) {
+            size_t sy = dy * stride;
+            size_t fileRow = topDown ? sy : (srcH - 1u - sy);
+            const uint8_t *srow = pixelBase + fileRow * srcRowBytes;
+            for (size_t dx = 0u; dx < outW; dx++) {
+                if (srow[(dx * stride) * 4u + 3u] != 0u) {
+                    hasAnyAlpha32 = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (size_t dy = 0u; dy < outH; dy++) {
+        size_t sy = dy * stride;
+        size_t fileRow = topDown ? sy : (srcH - 1u - sy);
+        const uint8_t *srow = pixelBase + fileRow * srcRowBytes;
+        uint8_t *drow = outBuf.ptr + dy * outBuf.bytesPerRow;
+        if (bpp == 24u) {
+            for (size_t dx = 0u; dx < outW; dx++) {
+                const uint8_t *sp = srow + (dx * stride) * 3u;
+                uint8_t *dp = drow + dx * 4u;
+                dp[0] = sp[2];
+                dp[1] = sp[1];
+                dp[2] = sp[0];
+                dp[3] = 255u;
+            }
+        } else {
+            for (size_t dx = 0u; dx < outW; dx++) {
+                const uint8_t *sp = srow + (dx * stride) * 4u;
+                uint8_t *dp = drow + dx * 4u;
+                dp[0] = sp[2];
+                dp[1] = sp[1];
+                dp[2] = sp[0];
+                dp[3] = hasAnyAlpha32 ? sp[3] : 255u;
+            }
+        }
+    }
+
+    bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, outW, outH);
+    return XSCBuildStaticPage(&outBuf, outW, outH, 1u, isGray);
+}
+
+#pragma mark - AVIF & HEIF Decoders (libavif / libheif)
+
+static uint32_t XSCAVIFTransformToEXIFOrientation(const avifImage *img) {
+    if (!img) return 1u;
+    bool hasRot = (img->transformFlags & AVIF_TRANSFORM_IROT) != 0u;
+    bool hasMir = (img->transformFlags & AVIF_TRANSFORM_IMIR) != 0u;
+    if (hasRot || hasMir) {
+        uint8_t angle = hasRot ? (img->irot.angle & 3u) : 0u;
+        if (!hasMir) {
+            static const uint32_t kRotMap[4] = { 1u, 8u, 3u, 6u };
+            return kRotMap[angle];
+        }
+        if (img->imir.axis == 1u) {
+            static const uint32_t kRotHFlip[4] = { 2u, 7u, 4u, 5u };
+            return kRotHFlip[angle];
+        }
+        static const uint32_t kRotVFlip[4] = { 4u, 5u, 2u, 7u };
+        return kRotVFlip[angle];
+    }
+    if (img->exif.data && img->exif.size >= 8u) {
+        size_t tiffOff = 0u;
+        if (img->exif.size >= 14u && memcmp(img->exif.data, "Exif\0\0", 6u) == 0) {
+            tiffOff = 6u;
+        }
+        return XSCParseTIFFOrientation(img->exif.data + tiffOff, img->exif.size - tiffOff);
+    }
+    return 1u;
+}
+
+static XSCDecodedPage *XSCDecodeAVIF(const uint8_t *bytes, size_t len) {
+    avifDecoder *decoder = avifDecoderCreate();
+    if (!decoder) return nil;
+    defer { avifDecoderDestroy(decoder); }
+
+    decoder->maxThreads = 1;
+    decoder->imageDimensionLimit = (uint32_t)kXSCMaxSourceDimension;
+    decoder->imageSizeLimit = (uint32_t)kXSCMaxSourcePixels;
+
+    if (avifDecoderSetIOMemory(decoder, bytes, len) != AVIF_RESULT_OK) {
+        return nil;
+    }
+    if (avifDecoderParse(decoder) != AVIF_RESULT_OK) {
+        return nil;
+    }
+    const avifImage *img = decoder->image;
+    if (!img || !XSCSourceDimensionsAllowed((size_t)img->width, (size_t)img->height)) {
+        return nil;
+    }
+    if (avifDecoderNextImage(decoder) != AVIF_RESULT_OK) {
+        return nil;
+    }
+    img = decoder->image;
+    if (!img || !XSCSourceDimensionsAllowed((size_t)img->width, (size_t)img->height)) {
+        return nil;
+    }
+
+    uint32_t orientation = XSCAVIFTransformToEXIFOrientation(img);
+    size_t srcW = (size_t)img->width;
+    size_t srcH = (size_t)img->height;
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAlloc(outW, outH, 4u, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    avifRGBImage rgb;
+    avifRGBImageSetDefaults(&rgb, img);
+    rgb.format = AVIF_RGB_FORMAT_RGBA;
+    rgb.depth = 8u;
+
+    if (stride == 1u) {
+        rgb.pixels = outBuf.ptr;
+        rgb.rowBytes = (uint32_t)outBuf.bytesPerRow;
+        if (avifImageYUVToRGB(img, &rgb) != AVIF_RESULT_OK) {
+            return nil;
+        }
+    } else {
+        if (avifRGBImageAllocatePixels(&rgb) != AVIF_RESULT_OK) {
+            return nil;
+        }
+        defer { avifRGBImageFreePixels(&rgb); }
+        if (avifImageYUVToRGB(img, &rgb) != AVIF_RESULT_OK) {
+            return nil;
+        }
+        for (size_t dy = 0u; dy < outH; dy++) {
+            const uint8_t *srow = rgb.pixels + (dy * stride) * (size_t)rgb.rowBytes;
+            uint8_t *drow = outBuf.ptr + dy * outBuf.bytesPerRow;
+            for (size_t dx = 0u; dx < outW; dx++) {
+                memcpy(drow + dx * 4u, srow + (dx * stride) * 4u, 4u);
+            }
+        }
+    }
+
+    bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, outW, outH);
+    return XSCBuildStaticPage(&outBuf, outW, outH, orientation, isGray);
+}
+
+static XSCDecodedPage *XSCDecodeHEIF(const uint8_t *bytes, size_t len) {
+    struct heif_context *ctx = heif_context_alloc();
+    if (!ctx) return nil;
+    defer { heif_context_free(ctx); }
+
+    heif_context_set_max_decoding_threads(ctx, 1);
+    heif_context_set_maximum_image_size_limit(ctx, (int)kXSCMaxSourceDimension);
+
+    struct heif_error err = heif_context_read_from_memory_without_copy(ctx, bytes, len, NULL);
+    if (err.code != heif_error_Ok) {
+        return nil;
+    }
+
+    struct heif_image_handle *handle = NULL;
+    err = heif_context_get_primary_image_handle(ctx, &handle);
+    if (err.code != heif_error_Ok || !handle) {
+        return nil;
+    }
+    defer { heif_image_handle_release(handle); }
+
+    int hw = heif_image_handle_get_width(handle);
+    int hh = heif_image_handle_get_height(handle);
+    if (hw <= 0 || hh <= 0 || !XSCSourceDimensionsAllowed((size_t)hw, (size_t)hh)) {
+        return nil;
+    }
+
+    struct heif_image *img = NULL;
+    err = heif_decode_image(handle, &img, heif_colorspace_RGB, heif_chroma_interleaved_RGBA, NULL);
+    if (err.code != heif_error_Ok || !img) {
+        return nil;
+    }
+    defer { heif_image_release(img); }
+
+    int iw = heif_image_get_width(img, heif_channel_interleaved);
+    int ih = heif_image_get_height(img, heif_channel_interleaved);
+    if (iw <= 0 || ih <= 0) {
+        return nil;
+    }
+    size_t srcW = (size_t)iw;
+    size_t srcH = (size_t)ih;
+    if (!XSCSourceDimensionsAllowed(srcW, srcH)) {
+        return nil;
+    }
+
+    size_t srcStride = 0u;
+    const uint8_t *plane = heif_image_get_plane_readonly2(img, heif_channel_interleaved, &srcStride);
+    if (!plane || srcStride < srcW * 4u) {
+        return nil;
+    }
+
+    size_t stride = XSCComputeDownsampleStride(srcW, srcH);
+    size_t outW = (srcW + stride - 1u) / stride;
+    size_t outH = (srcH + stride - 1u) / stride;
+
+    XSCMmapBuffer outBuf;
+    if (!XSCMmapAlloc(outW, outH, 4u, &outBuf)) {
+        return nil;
+    }
+    defer { XSCMmapFree(&outBuf); }
+
+    if (stride == 1u) {
+        for (size_t y = 0u; y < outH; y++) {
+            memcpy(outBuf.ptr + y * outBuf.bytesPerRow, plane + y * srcStride, outW * 4u);
+        }
+    } else {
+        for (size_t dy = 0u; dy < outH; dy++) {
+            const uint8_t *srow = plane + (dy * stride) * srcStride;
+            uint8_t *drow = outBuf.ptr + dy * outBuf.bytesPerRow;
+            for (size_t dx = 0u; dx < outW; dx++) {
+                memcpy(drow + dx * 4u, srow + (dx * stride) * 4u, 4u);
+            }
+        }
+    }
+
+    bool isGray = XSCMaybeRepackRGBAToGray8(&outBuf, outW, outH);
+    // libheif applies irot/imir transformations during decode by default.
+    return XSCBuildStaticPage(&outBuf, outW, outH, 1u, isGray);
+}
+
+#pragma mark - Unified Decode Entry Point
+
+static XSCDecodeResult XSCDecodePageDataResult(XSCData *data) {
+    if (!data || !data.bytes || data.length == 0u) {
+        return Err(XSCDecodedPage *, XSCError *,
+                   [XSCError errorWithDomain:XSCErrorDomainImage code:1 message:"Empty image payload"]);
+    }
+
+    const uint8_t *bytes = data.bytes;
+    size_t len = data.length;
+    XSCImageFormat fmt = XSCDetectImageFormat(bytes, len);
+    XSCDecodedPage *page = nil;
+
+    switch (fmt) {
+    case XSCImageFormatJPEG:
+        page = XSCDecodeJPEG(bytes, len);
+        break;
+    case XSCImageFormatPNG:
+        page = XSCDecodePNG(bytes, len);
+        break;
+    case XSCImageFormatGIF:
+        page = XSCDecodeGIF(data);
+        break;
+    case XSCImageFormatWebP:
+        page = XSCDecodeWebP(bytes, len);
+        break;
+    case XSCImageFormatTIFF:
+        page = XSCDecodeTIFF(bytes, len);
+        break;
+    case XSCImageFormatBMP:
+        page = XSCDecodeBMP(bytes, len);
+        break;
+    case XSCImageFormatAVIF:
+        page = XSCDecodeAVIF(bytes, len);
+        if (!page) {
+            page = XSCDecodeHEIF(bytes, len);
+        }
+        break;
+    case XSCImageFormatHEIF:
+        page = XSCDecodeHEIF(bytes, len);
+        if (!page) {
+            page = XSCDecodeAVIF(bytes, len);
+        }
+        break;
+    case XSCImageFormatUnknown:
+        return Err(XSCDecodedPage *, XSCError *,
+                   [XSCError errorWithDomain:XSCErrorDomainImage code:2 message:"Unrecognized image format"]);
+    }
+
+    if (!page) {
+        return Err(XSCDecodedPage *, XSCError *,
+                   [XSCError errorWithDomain:XSCErrorDomainImage code:3 message:"Image decode failed"]);
+    }
+    return Ok(XSCDecodedPage *, XSCError *, page);
+}
+
+#pragma mark - Compact Open-Addressed C Tables
+
+enum {
+    XSCSlotEmpty = 0,
+    XSCSlotOccupied = 1,
+    XSCSlotTombstone = 2,
+};
+
+typedef struct XSCCacheSlot {
+    uint64_t key;
+    uint64_t bookID;
+    size_t rank;
+    uint64_t lastAccessSeq;
+    void *pageRef; // Retained XSCDecodedPage * via __bridge_retained
+    uint8_t state;
+} XSCCacheSlot;
+
+typedef struct XSCCacheTable {
+    XSCCacheSlot *slots;
+    size_t capacity;
+    size_t count;
+    size_t tombstones;
+} XSCCacheTable;
+
+static bool XSCCacheTableInit(XSCCacheTable *t, size_t minCap) {
+    size_t cap = XSCNextPow2(minCap < 32u ? 32u : minCap);
+    t->slots = (XSCCacheSlot *)calloc(cap, sizeof(XSCCacheSlot));
+    if (!t->slots) return false;
+    t->capacity = cap;
+    t->count = 0u;
+    t->tombstones = 0u;
+    return true;
+}
+
+static void XSCCacheTableClear(XSCCacheTable *t) {
+    if (!t || !t->slots) return;
+    for (size_t i = 0u; i < t->capacity; i++) {
+        if (t->slots[i].state == XSCSlotOccupied && t->slots[i].pageRef) {
+            XSCDecodedPage *released = (__bridge_transfer XSCDecodedPage *)t->slots[i].pageRef;
+            (void)released;
+            t->slots[i].pageRef = NULL;
+        }
+        t->slots[i].state = XSCSlotEmpty;
+    }
+    t->count = 0u;
+    t->tombstones = 0u;
+}
+
+static void XSCCacheTableDestroy(XSCCacheTable *t) {
+    XSCCacheTableClear(t);
+    free(t->slots);
+    t->slots = NULL;
+    t->capacity = 0u;
+}
+
+static bool XSCCacheTableRehash(XSCCacheTable *t, size_t newCap) {
+    XSCCacheSlot *newSlots = (XSCCacheSlot *)calloc(newCap, sizeof(XSCCacheSlot));
+    if (!newSlots) return false;
+    size_t mask = newCap - 1u;
+    for (size_t i = 0u; i < t->capacity; i++) {
+        if (t->slots[i].state != XSCSlotOccupied) continue;
+        size_t idx = (size_t)(XSCHashU64(t->slots[i].key) & mask);
+        while (newSlots[idx].state == XSCSlotOccupied) {
+            idx = (idx + 1u) & mask;
+        }
+        newSlots[idx] = t->slots[i];
+    }
+    free(t->slots);
+    t->slots = newSlots;
+    t->capacity = newCap;
+    t->tombstones = 0u;
+    return true;
+}
+
+static XSCCacheSlot *XSCCacheTableFind(XSCCacheTable *t, uint64_t key) {
+    if (!t || !t->slots || t->count == 0u) return NULL;
+    size_t mask = t->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    for (size_t probes = 0u; probes < t->capacity; probes++) {
+        XSCCacheSlot *s = &t->slots[idx];
+        if (s->state == XSCSlotEmpty) return NULL;
+        if (s->state == XSCSlotOccupied && s->key == key) return s;
+        idx = (idx + 1u) & mask;
+    }
+    return NULL;
+}
+
+static void XSCCacheTableRemoveSlot(XSCCacheTable *t, XSCCacheSlot *s) {
+    if (!t || !s || s->state != XSCSlotOccupied) return;
+    if (s->pageRef) {
+        XSCDecodedPage *released = (__bridge_transfer XSCDecodedPage *)s->pageRef;
+        (void)released;
+        s->pageRef = NULL;
+    }
+    s->state = XSCSlotTombstone;
+    t->count--;
+    t->tombstones++;
+}
+
+static bool XSCCacheTablePut(XSCCacheTable *t,
+                             uint64_t key,
+                             XSCDecodedPage *page,
+                             uint64_t bookID,
+                             size_t rank,
+                             uint64_t seq) {
+    if (!t || !t->slots || !page) return false;
+    if ((t->count + t->tombstones + 1u) * 2u >= t->capacity) {
+        size_t nextCap = ((t->count + 1u) * 2u >= t->capacity) ? (t->capacity * 2u) : t->capacity;
+        if (!XSCCacheTableRehash(t, nextCap)) return false;
+    }
+    size_t mask = t->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    XSCCacheSlot *firstTombstone = NULL;
+    for (size_t probes = 0u; probes < t->capacity; probes++) {
+        XSCCacheSlot *s = &t->slots[idx];
+        if (s->state == XSCSlotEmpty) {
+            XSCCacheSlot *dst = firstTombstone ? firstTombstone : s;
+            if (dst->state == XSCSlotTombstone) t->tombstones--;
+            dst->key = key;
+            dst->bookID = bookID;
+            dst->rank = rank;
+            dst->lastAccessSeq = seq;
+            dst->pageRef = (__bridge_retained void *)page;
+            dst->state = XSCSlotOccupied;
+            t->count++;
+            return true;
+        }
+        if (s->state == XSCSlotOccupied && s->key == key) {
+            if (s->pageRef) {
+                XSCDecodedPage *released = (__bridge_transfer XSCDecodedPage *)s->pageRef;
+                (void)released;
+            }
+            s->bookID = bookID;
+            s->rank = rank;
+            s->lastAccessSeq = seq;
+            s->pageRef = (__bridge_retained void *)page;
+            return true;
+        }
+        if (s->state == XSCSlotTombstone && !firstTombstone) {
+            firstTombstone = s;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    return false;
+}
+
+/* Pure POD key -> size_t rank table (for _retentionRanks) */
+typedef struct XSCRankSlot {
+    uint64_t key;
+    size_t rank;
+    uint8_t state;
+} XSCRankSlot;
+
+typedef struct XSCRankTable {
+    XSCRankSlot *slots;
+    size_t capacity;
+    size_t count;
+    size_t tombstones;
+} XSCRankTable;
+
+static bool XSCRankTableInit(XSCRankTable *t, size_t minCap) {
+    size_t cap = XSCNextPow2(minCap < 32u ? 32u : minCap);
+    t->slots = (XSCRankSlot *)calloc(cap, sizeof(XSCRankSlot));
+    if (!t->slots) return false;
+    t->capacity = cap;
+    t->count = 0u;
+    t->tombstones = 0u;
+    return true;
+}
+
+static void XSCRankTableClear(XSCRankTable *t) {
+    if (!t || !t->slots) return;
+    memset(t->slots, 0, t->capacity * sizeof(XSCRankSlot));
+    t->count = 0u;
+    t->tombstones = 0u;
+}
+
+static void XSCRankTableDestroy(XSCRankTable *t) {
+    free(t->slots);
+    t->slots = NULL;
+    t->capacity = 0u;
+    t->count = 0u;
+    t->tombstones = 0u;
+}
+
+static bool XSCRankTableRehash(XSCRankTable *t, size_t newCap) {
+    XSCRankSlot *ns = (XSCRankSlot *)calloc(newCap, sizeof(XSCRankSlot));
+    if (!ns) return false;
+    size_t mask = newCap - 1u;
+    for (size_t i = 0u; i < t->capacity; i++) {
+        if (t->slots[i].state != XSCSlotOccupied) continue;
+        size_t idx = (size_t)(XSCHashU64(t->slots[i].key) & mask);
+        while (ns[idx].state == XSCSlotOccupied) {
+            idx = (idx + 1u) & mask;
+        }
+        ns[idx] = t->slots[i];
+    }
+    free(t->slots);
+    t->slots = ns;
+    t->capacity = newCap;
+    t->tombstones = 0u;
+    return true;
+}
+
+static bool XSCRankTableGet(const XSCRankTable *t, uint64_t key, size_t *outRank) {
+    if (!t || !t->slots || t->count == 0u) return false;
+    size_t mask = t->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    for (size_t probes = 0u; probes < t->capacity; probes++) {
+        const XSCRankSlot *s = &t->slots[idx];
+        if (s->state == XSCSlotEmpty) return false;
+        if (s->state == XSCSlotOccupied && s->key == key) {
+            if (outRank) *outRank = s->rank;
+            return true;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    return false;
+}
+
+static void XSCRankTablePut(XSCRankTable *t, uint64_t key, size_t rank, bool overwrite) {
+    if (!t || !t->slots) return;
+    if ((t->count + t->tombstones + 1u) * 2u >= t->capacity) {
+        size_t nextCap = ((t->count + 1u) * 2u >= t->capacity) ? (t->capacity * 2u) : t->capacity;
+        if (!XSCRankTableRehash(t, nextCap)) return;
+    }
+    size_t mask = t->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    XSCRankSlot *firstTombstone = NULL;
+    for (size_t probes = 0u; probes < t->capacity; probes++) {
+        XSCRankSlot *s = &t->slots[idx];
+        if (s->state == XSCSlotEmpty) {
+            XSCRankSlot *dst = firstTombstone ? firstTombstone : s;
+            if (dst->state == XSCSlotTombstone) t->tombstones--;
+            dst->key = key;
+            dst->rank = rank;
+            dst->state = XSCSlotOccupied;
+            t->count++;
+            return;
+        }
+        if (s->state == XSCSlotOccupied && s->key == key) {
+            if (overwrite) s->rank = rank;
+            return;
+        }
+        if (s->state == XSCSlotTombstone && !firstTombstone) {
+            firstTombstone = s;
+        }
+        idx = (idx + 1u) & mask;
+    }
+}
+
+/* Bounded negative cache set (_failedKeys) */
+typedef struct XSCFailedSlot {
+    uint64_t key;
+    uint64_t insertSeq;
+    uint8_t state;
+} XSCFailedSlot;
+
+typedef struct XSCFailedSet {
+    XSCFailedSlot *slots;
+    size_t capacity;
+    size_t count;
+    size_t tombstones;
+    uint64_t seq;
+} XSCFailedSet;
+
+static bool XSCFailedSetInit(XSCFailedSet *s, size_t minCap) {
+    size_t cap = XSCNextPow2(minCap < 32u ? 32u : minCap);
+    s->slots = (XSCFailedSlot *)calloc(cap, sizeof(XSCFailedSlot));
+    if (!s->slots) return false;
+    s->capacity = cap;
+    s->count = 0u;
+    s->tombstones = 0u;
+    s->seq = 0u;
+    return true;
+}
+
+static void XSCFailedSetClear(XSCFailedSet *s) {
+    if (!s || !s->slots) return;
+    memset(s->slots, 0, s->capacity * sizeof(XSCFailedSlot));
+    s->count = 0u;
+    s->tombstones = 0u;
+}
+
+static void XSCFailedSetDestroy(XSCFailedSet *s) {
+    free(s->slots);
+    s->slots = NULL;
+    s->capacity = 0u;
+    s->count = 0u;
+    s->tombstones = 0u;
+}
+
+static bool XSCFailedSetRehash(XSCFailedSet *s, size_t newCap) {
+    XSCFailedSlot *ns = (XSCFailedSlot *)calloc(newCap, sizeof(XSCFailedSlot));
+    if (!ns) return false;
+    size_t mask = newCap - 1u;
+    for (size_t i = 0u; i < s->capacity; i++) {
+        if (s->slots[i].state != XSCSlotOccupied) continue;
+        size_t idx = (size_t)(XSCHashU64(s->slots[i].key) & mask);
+        while (ns[idx].state == XSCSlotOccupied) {
+            idx = (idx + 1u) & mask;
+        }
+        ns[idx] = s->slots[i];
+    }
+    free(s->slots);
+    s->slots = ns;
+    s->capacity = newCap;
+    s->tombstones = 0u;
+    return true;
+}
+
+static bool XSCFailedSetContains(const XSCFailedSet *s, uint64_t key) {
+    if (!s || !s->slots || s->count == 0u) return false;
+    size_t mask = s->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    for (size_t probes = 0u; probes < s->capacity; probes++) {
+        const XSCFailedSlot *slot = &s->slots[idx];
+        if (slot->state == XSCSlotEmpty) return false;
+        if (slot->state == XSCSlotOccupied && slot->key == key) return true;
+        idx = (idx + 1u) & mask;
+    }
+    return false;
+}
+
+static void XSCFailedSetAddBounded(XSCFailedSet *s, uint64_t key, size_t maxCount) {
+    if (!s || !s->slots || maxCount == 0u) return;
+    if (XSCFailedSetContains(s, key)) return;
+
+    while (s->count >= maxCount) {
+        XSCFailedSlot *oldest = NULL;
+        for (size_t i = 0u; i < s->capacity; i++) {
+            if (s->slots[i].state == XSCSlotOccupied) {
+                if (!oldest || s->slots[i].insertSeq < oldest->insertSeq) {
+                    oldest = &s->slots[i];
+                }
+            }
+        }
+        if (!oldest) break;
+        oldest->state = XSCSlotTombstone;
+        s->count--;
+        s->tombstones++;
+    }
+
+    if ((s->count + s->tombstones + 1u) * 2u >= s->capacity) {
+        size_t nextCap = ((s->count + 1u) * 2u >= s->capacity) ? (s->capacity * 2u) : s->capacity;
+        if (!XSCFailedSetRehash(s, nextCap)) return;
+    }
+    size_t mask = s->capacity - 1u;
+    size_t idx = (size_t)(XSCHashU64(key) & mask);
+    XSCFailedSlot *firstTombstone = NULL;
+    for (size_t probes = 0u; probes < s->capacity; probes++) {
+        XSCFailedSlot *slot = &s->slots[idx];
+        if (slot->state == XSCSlotEmpty) {
+            XSCFailedSlot *dst = firstTombstone ? firstTombstone : slot;
+            if (dst->state == XSCSlotTombstone) s->tombstones--;
+            dst->key = key;
+            dst->insertSeq = ++s->seq;
+            dst->state = XSCSlotOccupied;
+            s->count++;
+            return;
+        }
+        if (slot->state == XSCSlotTombstone && !firstTombstone) {
+            firstTombstone = slot;
+        }
+        idx = (idx + 1u) & mask;
+    }
+}
+
+static void XSCFailedSetKeepBook(XSCFailedSet *s, uint64_t keepBookID) {
+    if (!s || !s->slots) return;
+    for (size_t i = 0u; i < s->capacity; i++) {
+        if (s->slots[i].state == XSCSlotOccupied && (s->slots[i].key >> 32) != keepBookID) {
+            s->slots[i].state = XSCSlotTombstone;
+            s->count--;
+            s->tombstones++;
+        }
+    }
+}
+
+#pragma mark - Pending Coalescing & Decode Job Objects
+
+@interface XSCCompletionNode : XSCObject {
+@public
+    XSCPageCompletion _block;
+    XSCCompletionNode *_next;
+}
+@end
+
+@implementation XSCCompletionNode
+@end
+
+@interface XSCDecodeJob : XSCObject {
+@public
+    XSCBook *_book;
+    size_t _index;
+    uint64_t _key;
+    uint64_t _bookID;
+    uint64_t _prefetchGen;
+    uint64_t _resetGen;
+    bool _isVisible;
+    bool _isPrewarm;
+    _Atomic(bool) _promotedToVisible;
+    XSCDecodeJob *_next;
+}
+@end
+
+@implementation XSCDecodeJob
+@end
+
+@interface XSCPendingNode : XSCObject {
+@public
+    uint64_t _key;
+    bool _isVisible;
+    size_t _rank;
+    XSCCompletionNode *_compHead;
+    XSCCompletionNode *_compTail;
+    XSCDecodeJob *_job;
+    XSCPendingNode *_next;
+}
+@end
+
+@implementation XSCPendingNode
+@end
+
+static void XSCPendingAppendCompletion(XSCPendingNode *node, XSCPageCompletion completion) {
+    if (!node || !completion) return;
+    XSCCompletionNode *cn = [[XSCCompletionNode alloc] init];
+    if (!cn) return;
+    cn->_block = completion; // ARC copies stack blocks automatically on __strong assignment
+    cn->_next = nil;
+    if (node->_compTail) {
+        node->_compTail->_next = cn;
+        node->_compTail = cn;
+    } else {
+        node->_compHead = cn;
+        node->_compTail = cn;
+    }
+}
+
+#pragma mark - XSCImageStore
+
+@implementation XSCImageStore {
+    size_t _maxEntryCount;
+    size_t _maxByteBudget;
+
+    bool _syncInitialized;
+    pthread_mutex_t _lock;
+    XSCCacheTable _cache;
+    XSCFailedSet _failedKeys;
+    XSCRankTable _retentionRanks;
+    XSCPendingNode *_pendingHead;
+    uint64_t _accessSeq;
+    size_t _currentByteCount;
+    uint64_t _resetGeneration;
+    uint64_t _keptBookID;
+    _Atomic(uint64_t) _prefetchGeneration;
+
+    // 4-lane priority decode pool (strictly independent lock from _lock)
+    pthread_mutex_t _poolLock;
+    pthread_cond_t _poolCond;
+    pthread_t _workers[4];
+    int _workerCount;
+    bool _poolStarted;
+    bool _poolShutdown;
+    int _activeBgCount;
+    XSCDecodeJob *_visHead;
+    XSCDecodeJob *_visTail;
+    XSCDecodeJob *_bgHead;
+    XSCDecodeJob *_bgTail;
+}
+
+- (size_t)maxEntryCount { return _maxEntryCount; }
+- (size_t)maxByteBudget { return _maxByteBudget; }
+
+/* Pure C helpers taking __unsafe_unretained store so worker threads never retain self during -dealloc. */
+
+static XSCPendingNode *XSCStoreLockedFindPending(__unsafe_unretained XSCImageStore *store, uint64_t key) {
+    XSCPendingNode *cur = store->_pendingHead;
+    while (cur) {
+        if (cur->_key == key) return cur;
+        cur = cur->_next;
+    }
+    return nil;
+}
+
+static XSCPendingNode *XSCStoreLockedPopPendingForJob(__unsafe_unretained XSCImageStore *store,
+                                                      uint64_t key,
+                                                      XSCDecodeJob *job) {
+    XSCPendingNode *prev = nil;
+    XSCPendingNode *cur = store->_pendingHead;
+    while (cur) {
+        if (cur->_key == key && cur->_job == job) {
+            if (prev) {
+                prev->_next = cur->_next;
+            } else {
+                store->_pendingHead = cur->_next;
+            }
+            cur->_next = nil;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->_next;
+    }
+    return nil;
+}
+
+/*
+ Retention-aware LRU victim selection: lower rank is more valuable (0 = visible).
+ Evicts the highest-rank (least useful) entry, breaking ties by oldest access.
+ Admission control refuses eviction if every resident outranks the incoming page.
+ */
+static XSCCacheSlot *XSCStoreLockedEvictionVictim(__unsafe_unretained XSCImageStore *store, size_t incomingRank) {
+    XSCCacheSlot *victim = NULL;
+    size_t worstRank = 0u;
+    uint64_t oldestSeq = UINT64_MAX;
+
+    for (size_t i = 0u; i < store->_cache.capacity; i++) {
+        XSCCacheSlot *s = &store->_cache.slots[i];
+        if (s->state != XSCSlotOccupied) continue;
+        if (!victim || s->rank > worstRank || (s->rank == worstRank && s->lastAccessSeq < oldestSeq)) {
+            victim = s;
+            worstRank = s->rank;
+            oldestSeq = s->lastAccessSeq;
+        }
+    }
+
+    if (!victim || worstRank < incomingRank) {
+        return NULL;
+    }
+    return victim;
+}
+
+static void XSCStoreLockedInsertPage(__unsafe_unretained XSCImageStore *store,
+                                     XSCDecodedPage *page,
+                                     uint64_t key,
+                                     uint64_t bookID,
+                                     size_t incomingRank) {
+    if (!page || page.byteCount > store->_maxByteBudget) {
+        return;
+    }
+
+    XSCCacheSlot *existing = XSCCacheTableFind(&store->_cache, key);
+    if (existing) {
+        XSCDecodedPage *oldPage = (__bridge XSCDecodedPage *)existing->pageRef;
+        if (oldPage) {
+            store->_currentByteCount -= oldPage.byteCount;
+        }
+        XSCCacheTableRemoveSlot(&store->_cache, existing);
+    }
+
+    while (store->_cache.count >= store->_maxEntryCount ||
+           page.byteCount > store->_maxByteBudget - store->_currentByteCount) {
+        XSCCacheSlot *victim = XSCStoreLockedEvictionVictim(store, incomingRank);
+        if (!victim) {
+            return;
+        }
+        XSCDecodedPage *vPage = (__bridge XSCDecodedPage *)victim->pageRef;
+        if (vPage) {
+            store->_currentByteCount -= vPage.byteCount;
+        }
+        XSCCacheTableRemoveSlot(&store->_cache, victim);
+    }
+
+    if (XSCCacheTablePut(&store->_cache, key, page, bookID, incomingRank, ++store->_accessSeq)) {
+        store->_currentByteCount += page.byteCount;
+    }
+}
+
+static bool XSCStoreEnqueueJob(__unsafe_unretained XSCImageStore *store, XSCDecodeJob *job);
+
+static void XSCStoreFinishDecode(__unsafe_unretained XSCImageStore *store,
+                                 XSCDecodeJob *job,
+                                 XSCDecodedPage *page,
+                                 bool cancelled) {
+    if (!job) return;
+    uint64_t key = job->_key;
+    uint64_t bookID = job->_bookID;
+    uint64_t resetGen = job->_resetGen;
+    bool isPrewarm = job->_isPrewarm;
+
+    XSCCompletionNode *completions = nil;
+    XSCDecodeJob *retryJob = nil;
+    bool effectiveCancelled = cancelled;
+
+    {
+        pthread_mutex_lock(&store->_lock);
+        defer { pthread_mutex_unlock(&store->_lock); }
+
+        bool staleBook = (resetGen != store->_resetGeneration) &&
+                         (store->_keptBookID == 0ull || bookID != store->_keptBookID);
+        effectiveCancelled = cancelled || staleBook;
+
+        XSCPendingNode *existingPending = XSCStoreLockedFindPending(store, key);
+        if (cancelled && !staleBook && !job->_isVisible &&
+            existingPending && existingPending->_isVisible && existingPending->_job == job) {
+            // A visible request coalesced onto this prefetch right as it saw a stale generation.
+            // Keep `existingPending` registered and re-dispatch as a visible priority job!
+            XSCDecodeJob *rj = [[XSCDecodeJob alloc] init];
+            rj->_book = job->_book;
+            rj->_index = job->_index;
+            rj->_key = key;
+            rj->_bookID = bookID;
+            rj->_prefetchGen = atomic_load_explicit(&store->_prefetchGeneration, memory_order_relaxed);
+            rj->_resetGen = store->_resetGeneration;
+            rj->_isVisible = true;
+            rj->_isPrewarm = false;
+            atomic_init(&rj->_promotedToVisible, true);
+            existingPending->_job = rj;
+            retryJob = rj;
+        } else {
+            XSCPendingNode *pending = XSCStoreLockedPopPendingForJob(store, key, job);
+
+            if (page && !effectiveCancelled) {
+                size_t rank = SIZE_MAX;
+                if (pending && pending->_isVisible) {
+                    rank = 0u;
+                } else if (!XSCRankTableGet(&store->_retentionRanks, key, &rank) && isPrewarm) {
+                    rank = 1000u;
+                }
+                XSCStoreLockedInsertPage(store, page, key, bookID, rank);
+            } else if (!page && !effectiveCancelled) {
+                XSCFailedSetAddBounded(&store->_failedKeys, key, store->_maxEntryCount);
+            }
+
+            if (pending) {
+                completions = pending->_compHead;
+                pending->_compHead = nil;
+                pending->_compTail = nil;
+                pending->_job = nil;
+            }
+        }
+    }
+
+    if (retryJob) {
+        if (!XSCStoreEnqueueJob(store, retryJob)) {
+            XSCStoreFinishDecode(store, retryJob, nil, true);
+        }
+        return;
+    }
+
+    if (completions) {
+        XSCDecodedPage *deliverPage = effectiveCancelled ? nil : page;
+        bool failed = (deliverPage == nil && !effectiveCancelled);
+        xsc_dispatch_main(^{
+            XSCOptDecodedPage optPage = deliverPage
+                                            ? Some(XSCDecodedPage *, deliverPage)
+                                            : None(XSCDecodedPage *);
+            XSCCompletionNode *cur = completions;
+            while (cur) {
+                XSCCompletionNode *next = cur->_next;
+                XSCPageCompletion blk = cur->_block;
+                cur->_next = nil;
+                cur->_block = nil;
+                if (blk) {
+                    blk(optPage, failed);
+                }
+                cur = next;
+            }
+        });
+    }
+}
+
+static void XSCStoreExecuteJob(__unsafe_unretained XSCImageStore *store, XSCDecodeJob *job) {
+    if (!job) return;
+    bool isVisibleNow = job->_isVisible ||
+                        atomic_load_explicit(&job->_promotedToVisible, memory_order_acquire);
+
+    if (!isVisibleNow && !job->_isPrewarm) {
+        uint64_t curGen = atomic_load_explicit(&store->_prefetchGeneration, memory_order_relaxed);
+        if (curGen != job->_prefetchGen) {
+            XSCStoreFinishDecode(store, job, nil, true);
+            return;
+        }
+    }
+
+    XSCDecodedPage *decoded = nil;
+    XSCData *rawData = nil;
+    handle {
+        rawData = tryValue([job->_book readPageDataAtIndex:job->_index]);
+    } catch(XSCError *err) {
+        (void)err;
+        rawData = nil;
+    }
+    if (rawData) {
+        XSCDecodeResult res = XSCDecodePageDataResult(rawData);
+        match(res) {
+            case .Ok(let page): {
+                decoded = page;
+            }
+            case .Err(let err): {
+                (void)err;
+                decoded = nil;
+            }
+        }
+    }
+
+    XSCStoreFinishDecode(store, job, decoded, false);
+}
+
+static void *XSCDecodeWorkerMain(void *arg) {
+    __unsafe_unretained XSCImageStore *store = (__bridge XSCImageStore *)arg;
+    for (;;) {
+        // Completion handoff and ARC cleanup can autorelease after decoding.
+        @autoreleasepool {
+            XSCDecodeJob *job = nil;
+            bool isBgJob = false;
+            {
+                pthread_mutex_lock(&store->_poolLock);
+                defer { pthread_mutex_unlock(&store->_poolLock); }
+
+                for (;;) {
+                    if (store->_poolShutdown) {
+                        return NULL;
+                    }
+                    // Visible demand always takes precedence and can use all 4 lanes.
+                    if (store->_visHead) {
+                        job = store->_visHead;
+                        store->_visHead = job->_next;
+                        if (!store->_visHead) store->_visTail = nil;
+                        job->_next = nil;
+                        break;
+                    }
+                    // Background prefetch/prewarm is capped at 3 active lanes (1 lane reserved for visible demand).
+                    if (store->_bgHead && store->_activeBgCount < kXSCDecodeMaxBackgroundActive) {
+                        job = store->_bgHead;
+                        store->_bgHead = job->_next;
+                        if (!store->_bgHead) store->_bgTail = nil;
+                        job->_next = nil;
+                        store->_activeBgCount++;
+                        isBgJob = true;
+                        break;
+                    }
+                    pthread_cond_wait(&store->_poolCond, &store->_poolLock);
+                }
+            }
+
+            XSCStoreExecuteJob(store, job);
+
+            if (isBgJob) {
+                pthread_mutex_lock(&store->_poolLock);
+                store->_activeBgCount--;
+                pthread_cond_signal(&store->_poolCond);
+                pthread_mutex_unlock(&store->_poolLock);
+            }
+        }
+    }
+}
+
+static bool XSCStorePoolEnsureStartedLocked(__unsafe_unretained XSCImageStore *store) {
+    if (store->_poolShutdown) return false;
+    if (store->_poolStarted) return store->_workerCount > 0;
+    store->_workerCount = 0;
+    for (int i = 0; i < kXSCDecodeWorkerCount; i++) {
+        if (pthread_create(&store->_workers[store->_workerCount],
+                           NULL,
+                           XSCDecodeWorkerMain,
+                           (__bridge void *)store) == 0) {
+            store->_workerCount++;
+        }
+    }
+    if (store->_workerCount == 0) {
+        return false;
+    }
+    store->_poolStarted = true;
+    return true;
+}
+
+static bool XSCStoreEnqueueJob(__unsafe_unretained XSCImageStore *store, XSCDecodeJob *job) {
+    if (!job) return false;
+    pthread_mutex_lock(&store->_poolLock);
+    defer { pthread_mutex_unlock(&store->_poolLock); }
+
+    if (store->_poolShutdown || !XSCStorePoolEnsureStartedLocked(store)) {
+        return false;
+    }
+    job->_next = nil;
+    if (job->_isVisible) {
+        if (store->_visTail) {
+            store->_visTail->_next = job;
+            store->_visTail = job;
+        } else {
+            store->_visHead = job;
+            store->_visTail = job;
+        }
+    } else {
+        if (store->_bgTail) {
+            store->_bgTail->_next = job;
+            store->_bgTail = job;
+        } else {
+            store->_bgHead = job;
+            store->_bgTail = job;
+        }
+    }
+    pthread_cond_signal(&store->_poolCond);
+    return true;
+}
+
+static void XSCStorePromoteJobToVisible(__unsafe_unretained XSCImageStore *store, XSCDecodeJob *job) {
+    if (!job) return;
+    atomic_store_explicit(&job->_promotedToVisible, true, memory_order_release);
+
+    pthread_mutex_lock(&store->_poolLock);
+    defer { pthread_mutex_unlock(&store->_poolLock); }
+    if (store->_poolShutdown) return;
+
+    // If still sitting in the background queue, unlink and move to the visible demand queue.
+    XSCDecodeJob *prev = nil;
+    XSCDecodeJob *cur = store->_bgHead;
+    while (cur) {
+        if (cur == job) {
+            if (prev) {
+                prev->_next = cur->_next;
+            } else {
+                store->_bgHead = cur->_next;
+            }
+            if (store->_bgTail == cur) {
+                store->_bgTail = prev;
+            }
+            cur->_next = nil;
+            cur->_isVisible = true;
+            if (store->_visTail) {
+                store->_visTail->_next = cur;
+                store->_visTail = cur;
+            } else {
+                store->_visHead = cur;
+                store->_visTail = cur;
+            }
+            pthread_cond_signal(&store->_poolCond);
+            return;
+        }
+        prev = cur;
+        cur = cur->_next;
+    }
+}
+
+static void XSCStoreShutdownInternal(__unsafe_unretained XSCImageStore *store) {
+    int countToJoin = 0;
+    pthread_t toJoin[4];
+    {
+        pthread_mutex_lock(&store->_poolLock);
+        defer { pthread_mutex_unlock(&store->_poolLock); }
+        store->_poolShutdown = true;
+        if (store->_poolStarted) {
+            countToJoin = store->_workerCount;
+            for (int i = 0; i < countToJoin; i++) {
+                toJoin[i] = store->_workers[i];
+            }
+            store->_workerCount = 0;
+            store->_poolStarted = false;
+        }
+        pthread_cond_broadcast(&store->_poolCond);
+    }
+
+    if (countToJoin > 0) {
+        for (int i = 0; i < countToJoin; i++) {
+            pthread_join(toJoin[i], NULL);
+        }
+    }
+
+    {
+        pthread_mutex_lock(&store->_poolLock);
+        defer { pthread_mutex_unlock(&store->_poolLock); }
+        store->_visHead = nil;
+        store->_visTail = nil;
+        store->_bgHead = nil;
+        store->_bgTail = nil;
+    }
+
+    {
+        pthread_mutex_lock(&store->_lock);
+        defer { pthread_mutex_unlock(&store->_lock); }
+        XSCPendingNode *p = store->_pendingHead;
+        store->_pendingHead = nil;
+        while (p) {
+            XSCPendingNode *next = p->_next;
+            p->_next = nil;
+            p->_compHead = nil;
+            p->_compTail = nil;
+            p->_job = nil;
+            p = next;
+        }
+    }
+}
+
+- (instancetype)init {
+    return [self initWithMaxEntryCount:kXSCDefaultMaxEntries maxByteBudget:kXSCDefaultMaxBytes];
+}
+
+- (instancetype)initWithMaxEntryCount:(size_t)maxEntries maxByteBudget:(size_t)maxBytes {
+    self = [super init];
+    if (self) {
+        _maxEntryCount = maxEntries > 0u ? maxEntries : kXSCDefaultMaxEntries;
+        _maxByteBudget = maxBytes > 0u ? maxBytes : kXSCDefaultMaxBytes;
+        if (_maxEntryCount > SIZE_MAX / 8u || pthread_mutex_init(&_lock, NULL) != 0) {
+            return nil;
+        }
+        if (pthread_mutex_init(&_poolLock, NULL) != 0) {
+            pthread_mutex_destroy(&_lock);
+            return nil;
+        }
+        if (pthread_cond_init(&_poolCond, NULL) != 0) {
+            pthread_mutex_destroy(&_poolLock);
+            pthread_mutex_destroy(&_lock);
+            return nil;
+        }
+        _syncInitialized = true;
+
+        size_t tableMin = _maxEntryCount * 4u;
+        if (!XSCCacheTableInit(&_cache, tableMin) ||
+            !XSCFailedSetInit(&_failedKeys, tableMin) ||
+            !XSCRankTableInit(&_retentionRanks, tableMin)) {
+            return nil;
+        }
+
+        _pendingHead = nil;
+        _accessSeq = 0u;
+        _currentByteCount = 0u;
+        _resetGeneration = 0u;
+        _keptBookID = 0u;
+        atomic_init(&_prefetchGeneration, 0u);
+        _workerCount = 0;
+        _poolStarted = false;
+        _poolShutdown = false;
+        _activeBgCount = 0;
+        _visHead = nil;
+        _visTail = nil;
+        _bgHead = nil;
+        _bgTail = nil;
+    }
+    return self;
+}
+
+- (void)shutdown {
+    XSCStoreShutdownInternal(self);
+}
+
+- (void)dealloc {
+    if (!_syncInitialized) return;
+    XSCStoreShutdownInternal(self);
+    XSCCacheTableDestroy(&_cache);
+    XSCFailedSetDestroy(&_failedKeys);
+    XSCRankTableDestroy(&_retentionRanks);
+    pthread_cond_destroy(&_poolCond);
+    pthread_mutex_destroy(&_poolLock);
+    pthread_mutex_destroy(&_lock);
+}
+
+- (size_t)currentEntryCount {
+    pthread_mutex_lock(&_lock);
+    defer { pthread_mutex_unlock(&_lock); }
+    return _cache.count;
+}
+
+- (size_t)currentByteCount {
+    pthread_mutex_lock(&_lock);
+    defer { pthread_mutex_unlock(&_lock); }
+    return _currentByteCount;
+}
+
+- (XSCOptDecodedPage)cachedPageForBook:(XSCBook *)book index:(size_t)index {
+    if (!book || index >= book.pageCount) {
+        return None(XSCDecodedPage *);
+    }
+    uint64_t key = XSCPageCacheKey(book.bookID, index);
+
+    pthread_mutex_lock(&_lock);
+    defer { pthread_mutex_unlock(&_lock); }
+
+    XSCCacheSlot *slot = XSCCacheTableFind(&_cache, key);
+    if (!slot || !slot->pageRef) {
+        return None(XSCDecodedPage *);
+    }
+    XSCDecodedPage *page = (__bridge XSCDecodedPage *)slot->pageRef;
+    slot->lastAccessSeq = ++_accessSeq;
+    return Some(XSCDecodedPage *, page);
+}
+
+- (void)requestPageForBook:(XSCBook *)book
+                     index:(size_t)index
+                  priority:(bool)isVisible
+                completion:(XSCPageCompletion)completion {
+    if (!book || index >= book.pageCount) {
+        if (completion) {
+            xsc_dispatch_main(^{ completion(None(XSCDecodedPage *), true); });
+        }
+        return;
+    }
+
+    uint64_t bookID = book.bookID;
+    uint64_t key = XSCPageCacheKey(bookID, index);
+    XSCDecodeJob *jobToEnqueue = nil;
+    XSCDecodeJob *jobToPromote = nil;
+    XSCDecodedPage *hitPage = nil;
+    bool hitFailed = false;
+
+    {
+        pthread_mutex_lock(&_lock);
+        defer { pthread_mutex_unlock(&_lock); }
+
+        // 1. Check cache hit
+        XSCCacheSlot *hit = XSCCacheTableFind(&_cache, key);
+        if (hit && hit->pageRef) {
+            hit->lastAccessSeq = ++_accessSeq;
+            if (isVisible) {
+                hit->rank = 0u;
+            }
+            hitPage = (__bridge XSCDecodedPage *)hit->pageRef;
+        }
+
+        if (!hitPage) {
+            // 2. Check negative cache
+            if (XSCFailedSetContains(&_failedKeys, key)) {
+                hitFailed = true;
+            } else {
+                // 3. Coalesce with in-flight decode
+                XSCPendingNode *existing = XSCStoreLockedFindPending(self, key);
+                if (existing) {
+                    XSCPendingAppendCompletion(existing, completion);
+                    if (isVisible) {
+                        existing->_isVisible = true;
+                        existing->_rank = 0u;
+                        jobToPromote = existing->_job;
+                        if (jobToPromote) {
+                            atomic_store_explicit(&jobToPromote->_promotedToVisible, true, memory_order_release);
+                        }
+                    }
+                } else {
+                    // 4. Start new decode
+                    XSCPendingNode *pending = [[XSCPendingNode alloc] init];
+                    pending->_key = key;
+                    pending->_isVisible = isVisible;
+                    size_t retRank = SIZE_MAX;
+                    if (isVisible) {
+                        pending->_rank = 0u;
+                    } else if (XSCRankTableGet(&_retentionRanks, key, &retRank)) {
+                        pending->_rank = retRank;
+                    } else {
+                        pending->_rank = SIZE_MAX;
+                    }
+                    XSCPendingAppendCompletion(pending, completion);
+
+                    XSCDecodeJob *job = [[XSCDecodeJob alloc] init];
+                    job->_book = book;
+                    job->_index = index;
+                    job->_key = key;
+                    job->_bookID = bookID;
+                    job->_prefetchGen = atomic_load_explicit(&_prefetchGeneration, memory_order_relaxed);
+                    job->_resetGen = _resetGeneration;
+                    job->_isVisible = isVisible;
+                    job->_isPrewarm = false;
+                    atomic_init(&job->_promotedToVisible, isVisible);
+
+                    pending->_job = job;
+                    pending->_next = _pendingHead;
+                    _pendingHead = pending;
+                    jobToEnqueue = job;
+                }
+            }
+        }
+    }
+
+    if (hitPage) {
+        if (completion) {
+            xsc_dispatch_main(^{ completion(Some(XSCDecodedPage *, hitPage), false); });
+        }
+        return;
+    }
+    if (hitFailed) {
+        if (completion) {
+            xsc_dispatch_main(^{ completion(None(XSCDecodedPage *), true); });
+        }
+        return;
+    }
+    if (jobToPromote) {
+        XSCStorePromoteJobToVisible(self, jobToPromote);
+        return;
+    }
+    if (jobToEnqueue) {
+        if (!XSCStoreEnqueueJob(self, jobToEnqueue)) {
+            XSCStoreFinishDecode(self, jobToEnqueue, nil, true);
+        }
+    }
+}
+
+- (void)updateRetentionAndPrefetchForBook:(XSCBook *)book
+                           visibleIndices:(XSCIndexList *)visibleIndices
+                           orderedIndices:(XSCIndexList *)orderedIndices {
+    if (!book) return;
+
+    uint64_t bookID = book.bookID;
+    size_t pageCount = book.pageCount;
+    uint64_t gen = atomic_fetch_add_explicit(&_prefetchGeneration, 1u, memory_order_relaxed) + 1u;
+
+    XSCDecodeJob *batchHead = nil;
+    XSCDecodeJob *batchTail = nil;
+
+    {
+        pthread_mutex_lock(&_lock);
+        defer { pthread_mutex_unlock(&_lock); }
+
+        uint64_t resetGen = _resetGeneration;
+        XSCRankTableClear(&_retentionRanks);
+
+        if (visibleIndices) {
+            size_t visCount = visibleIndices.count;
+            const size_t *visVals = visibleIndices.values;
+            for (size_t i = 0u; i < visCount; i++) {
+                uint64_t k = XSCPageCacheKey(bookID, visVals[i]);
+                XSCRankTablePut(&_retentionRanks, k, 0u, true);
+            }
+        }
+
+        if (orderedIndices) {
+            size_t ordCount = orderedIndices.count;
+            const size_t *ordVals = orderedIndices.values;
+            size_t rank = 1u;
+            for (size_t i = 0u; i < ordCount; i++) {
+                size_t idx = ordVals[i];
+                if (idx >= pageCount) continue;
+                uint64_t k = XSCPageCacheKey(bookID, idx);
+                XSCRankTablePut(&_retentionRanks, k, rank, false);
+                rank++;
+            }
+        }
+
+        // Update eviction priority across resident entries.
+        for (size_t i = 0u; i < _cache.capacity; i++) {
+            XSCCacheSlot *slot = &_cache.slots[i];
+            if (slot->state != XSCSlotOccupied || !slot->pageRef) continue;
+
+            size_t newRank = SIZE_MAX;
+            if (XSCRankTableGet(&_retentionRanks, slot->key, &newRank)) {
+                slot->rank = newRank;
+            } else {
+                slot->rank = slot->bookID != bookID ? 1000u : SIZE_MAX;
+            }
+        }
+
+        // Register missing prefetch targets before unlocking to prevent duplicates.
+        if (orderedIndices) {
+            size_t ordCount = orderedIndices.count;
+            const size_t *ordVals = orderedIndices.values;
+            for (size_t i = 0u; i < ordCount; i++) {
+                size_t idx = ordVals[i];
+                if (idx >= pageCount) continue;
+                uint64_t k = XSCPageCacheKey(bookID, idx);
+                if (XSCCacheTableFind(&_cache, k) ||
+                    XSCFailedSetContains(&_failedKeys, k) ||
+                    XSCStoreLockedFindPending(self, k)) {
+                    continue;
+                }
+
+                size_t retRank = SIZE_MAX;
+                (void)XSCRankTableGet(&_retentionRanks, k, &retRank);
+
+                XSCPendingNode *pending = [[XSCPendingNode alloc] init];
+                pending->_key = k;
+                pending->_isVisible = false;
+                pending->_rank = retRank;
+
+                XSCDecodeJob *job = [[XSCDecodeJob alloc] init];
+                job->_book = book;
+                job->_index = idx;
+                job->_key = k;
+                job->_bookID = bookID;
+                job->_prefetchGen = gen;
+                job->_resetGen = resetGen;
+                job->_isVisible = false;
+                job->_isPrewarm = false;
+                atomic_init(&job->_promotedToVisible, false);
+
+                pending->_job = job;
+                pending->_next = _pendingHead;
+                _pendingHead = pending;
+
+                if (batchTail) {
+                    batchTail->_next = job;
+                    batchTail = job;
+                } else {
+                    batchHead = job;
+                    batchTail = job;
+                }
+            }
+        }
+    }
+
+    while (batchHead) {
+        XSCDecodeJob *next = batchHead->_next;
+        batchHead->_next = nil;
+        if (!XSCStoreEnqueueJob(self, batchHead)) {
+            XSCStoreFinishDecode(self, batchHead, nil, true);
+        }
+        batchHead = next;
+    }
+}
+
+- (void)prewarmPageForBook:(XSCBook *)book index:(size_t)index {
+    if (!book || index >= book.pageCount) return;
+
+    uint64_t bookID = book.bookID;
+    uint64_t key = XSCPageCacheKey(bookID, index);
+    XSCDecodeJob *jobToEnqueue = nil;
+
+    {
+        pthread_mutex_lock(&_lock);
+        defer { pthread_mutex_unlock(&_lock); }
+
+        if (XSCCacheTableFind(&_cache, key) ||
+            XSCFailedSetContains(&_failedKeys, key) ||
+            XSCStoreLockedFindPending(self, key)) {
+            return;
+        }
+
+        XSCPendingNode *pending = [[XSCPendingNode alloc] init];
+        pending->_key = key;
+        pending->_isVisible = false;
+        pending->_rank = 1000u;
+
+        XSCDecodeJob *job = [[XSCDecodeJob alloc] init];
+        job->_book = book;
+        job->_index = index;
+        job->_key = key;
+        job->_bookID = bookID;
+        job->_prefetchGen = atomic_load_explicit(&_prefetchGeneration, memory_order_relaxed);
+        job->_resetGen = _resetGeneration;
+        job->_isVisible = false;
+        job->_isPrewarm = true;
+        atomic_init(&job->_promotedToVisible, false);
+
+        pending->_job = job;
+        pending->_next = _pendingHead;
+        _pendingHead = pending;
+        jobToEnqueue = job;
+    }
+
+    if (jobToEnqueue && !XSCStoreEnqueueJob(self, jobToEnqueue)) {
+        XSCStoreFinishDecode(self, jobToEnqueue, nil, true);
+    }
+}
+
+- (void)resetKeepingBook:(XSCOptBook)keepBook {
+    atomic_fetch_add_explicit(&_prefetchGeneration, 1u, memory_order_relaxed);
+
+    uint64_t keepID = 0ull;
+    bool hasKeep = false;
+    match(keepBook) {
+        case .Some(let book): {
+            if (book) {
+                keepID = book.bookID;
+                hasKeep = true;
+            }
+        }
+        case .None: {
+            hasKeep = false;
+        }
+    }
+
+    XSCCompletionNode *cancelledHead = nil;
+    XSCCompletionNode *cancelledTail = nil;
+
+    {
+        pthread_mutex_lock(&_lock);
+        defer { pthread_mutex_unlock(&_lock); }
+
+        _resetGeneration++;
+        _keptBookID = keepID;
+
+        // Pop stale pending nodes so subsequent requests for the same book never
+        // coalesce onto a pre-reset job whose result will be discarded.
+        XSCPendingNode *prev = nil;
+        XSCPendingNode *cur = _pendingHead;
+        while (cur) {
+            XSCPendingNode *next = cur->_next;
+            bool dropNode = !hasKeep || ((cur->_key >> 32) != keepID);
+            if (dropNode) {
+                if (prev) {
+                    prev->_next = next;
+                } else {
+                    _pendingHead = next;
+                }
+                cur->_next = nil;
+                cur->_job = nil;
+                if (cur->_compHead) {
+                    if (cancelledTail) {
+                        cancelledTail->_next = cur->_compHead;
+                    } else {
+                        cancelledHead = cur->_compHead;
+                    }
+                    cancelledTail = cur->_compTail;
+                    cur->_compHead = nil;
+                    cur->_compTail = nil;
+                }
+            } else {
+                prev = cur;
+            }
+            cur = next;
+        }
+
+        if (!hasKeep) {
+            XSCCacheTableClear(&_cache);
+            XSCFailedSetClear(&_failedKeys);
+            XSCRankTableClear(&_retentionRanks);
+            _currentByteCount = 0u;
+        } else {
+            for (size_t i = 0u; i < _cache.capacity; i++) {
+                XSCCacheSlot *slot = &_cache.slots[i];
+                if (slot->state == XSCSlotOccupied && slot->bookID != keepID) {
+                    XSCDecodedPage *p = (__bridge XSCDecodedPage *)slot->pageRef;
+                    if (p) {
+                        _currentByteCount -= p.byteCount;
+                    }
+                    XSCCacheTableRemoveSlot(&_cache, slot);
+                }
+            }
+            XSCFailedSetKeepBook(&_failedKeys, keepID);
+            for (size_t i = 0u; i < _retentionRanks.capacity; i++) {
+                if (_retentionRanks.slots[i].state == XSCSlotOccupied &&
+                    (_retentionRanks.slots[i].key >> 32) != keepID) {
+                    _retentionRanks.slots[i].state = XSCSlotTombstone;
+                    _retentionRanks.count--;
+                    _retentionRanks.tombstones++;
+                }
+            }
+        }
+    }
+
+    if (cancelledHead) {
+        xsc_dispatch_main(^{
+            XSCOptDecodedPage nonePage = None(XSCDecodedPage *);
+            XSCCompletionNode *c = cancelledHead;
+            while (c) {
+                XSCCompletionNode *next = c->_next;
+                XSCPageCompletion blk = c->_block;
+                c->_next = nil;
+                c->_block = nil;
+                if (blk) {
+                    blk(nonePage, false);
+                }
+                c = next;
+            }
+        });
+    }
+}
+
+@end
